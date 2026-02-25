@@ -3,4 +3,5 @@ dist/
 data/artifacts/
 data/logs/
 data/runs/
+runs/
 *.log

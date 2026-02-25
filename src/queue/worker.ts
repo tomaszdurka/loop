@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadQueueConfig } from './config.js';
 import type { JobRow } from './types.js';
 
@@ -13,14 +16,18 @@ type CommandResult = {
   spawnError: string | null;
 };
 
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const RUNS_ROOT = resolve(PROJECT_ROOT, 'runs');
+const LOOP_RUNNER_PATH = resolve(PROJECT_ROOT, 'src', 'agentic-loop-runner', 'index.ts');
+
 type LeaseResponse = {
   job: JobRow | null;
   attempt_no?: number;
 };
 
-function runCommand(command: string, args: string[]): Promise<CommandResult> {
+function runCommand(command: string, args: string[], cwd: string): Promise<CommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd });
 
     let output = '';
 
@@ -95,10 +102,16 @@ async function complete(baseUrl: string, workerId: string, jobId: string, payloa
   });
 }
 
-async function runJobViaExistingLoop(job: JobRow): Promise<CommandResult> {
+function createRunDir(runId: string): string {
+  const runDir = resolve(RUNS_ROOT, runId);
+  mkdirSync(runDir, { recursive: true });
+  return runDir;
+}
+
+async function runJobViaExistingLoop(job: JobRow, runDir: string): Promise<CommandResult> {
   const args = [
     'tsx',
-    'src/agentic-loop-runner/index.ts',
+    LOOP_RUNNER_PATH,
     '--prompt',
     job.prompt,
     '--max-iterations',
@@ -109,10 +122,12 @@ async function runJobViaExistingLoop(job: JobRow): Promise<CommandResult> {
     args.push('--success', job.success_criteria);
   }
 
-  return runCommand('npx', args);
+  return runCommand('npx', args, runDir);
 }
 
 async function executeJob(baseUrl: string, workerId: string, leaseTtlMs: number, job: JobRow): Promise<void> {
+  const runId = `${job.id}-${Date.now()}`;
+  const runDir = createRunDir(runId);
   const heartbeatTimer = setInterval(() => {
     heartbeat(baseUrl, workerId, job.id, leaseTtlMs).catch((error) => {
       console.error(`[queue-worker] heartbeat failed for ${job.id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -120,7 +135,8 @@ async function executeJob(baseUrl: string, workerId: string, leaseTtlMs: number,
   }, Math.max(1000, Math.floor(leaseTtlMs / 3)));
 
   try {
-    const result = await runJobViaExistingLoop(job);
+    const result = await runJobViaExistingLoop(job, runDir);
+    const outputWithRunDir = `RUN_DIR=${runDir}\n\n${result.output}`;
 
     let judgeDecision: 'YES' | 'NO' | null = null;
     let judgeExplanation: string | null = null;
@@ -146,7 +162,7 @@ async function executeJob(baseUrl: string, workerId: string, leaseTtlMs: number,
       worker_exit_code: result.exitCode,
       judge_decision: judgeDecision,
       judge_explanation: judgeExplanation,
-      output: result.output,
+      output: outputWithRunDir,
       succeeded,
       error_message: errorMessage,
       finished_at: new Date().toISOString()
@@ -158,7 +174,7 @@ async function executeJob(baseUrl: string, workerId: string, leaseTtlMs: number,
       worker_exit_code: null,
       judge_decision: 'NO',
       judge_explanation: 'Worker runtime error',
-      output: error instanceof Error ? error.stack ?? error.message : String(error),
+      output: `RUN_DIR=${runDir}\n\n${error instanceof Error ? error.stack ?? error.message : String(error)}`,
       succeeded: false,
       error_message: 'Worker runtime error',
       finished_at: new Date().toISOString()
