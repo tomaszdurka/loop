@@ -77,6 +77,7 @@ async function main(): Promise<void> {
     const rest = args.slice(1);
     try {
       const config = parseRunConfig(rest);
+      console.log(config)
       await runAgenticLoopCommand(config);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Invalid run arguments';
