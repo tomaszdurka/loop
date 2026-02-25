@@ -1,7 +1,6 @@
 node_modules/
 dist/
-data/artifacts/
-data/logs/
-data/runs/
+data/
 runs/
+.agents
 *.log

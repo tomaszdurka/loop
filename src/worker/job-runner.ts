@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { JobRow } from '../queue/types.js';
@@ -136,6 +136,11 @@ async function complete(baseUrl: string, workerId: string, jobId: string, payloa
 function createRunDir(runId: string): string {
   const runDir = resolve(RUNS_ROOT, runId);
   mkdirSync(runDir, { recursive: true });
+  const sourceAgentsDir = resolve(PROJECT_ROOT, '.agents');
+  const targetAgentsDir = resolve(runDir, '.agents');
+  if (existsSync(sourceAgentsDir)) {
+    cpSync(sourceAgentsDir, targetAgentsDir, { recursive: true });
+  }
   return runDir;
 }
 
