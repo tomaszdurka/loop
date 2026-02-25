@@ -17,6 +17,7 @@ npm run loop -- --prompt "Implement X" --success "All tests pass and file Y exis
 Optional flags:
 
 - `--max-iterations 5`
+- `--provider codex|claude` (default `codex`)
 
 The script:
 

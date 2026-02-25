@@ -96,25 +96,20 @@ async function complete(baseUrl: string, workerId: string, jobId: string, payloa
 }
 
 async function runJobViaExistingLoop(job: JobRow): Promise<CommandResult> {
-  if (!job.success_criteria) {
-    return runCommand('codex', [
-      'exec',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--skip-git-repo-check',
-      job.prompt
-    ]);
-  }
-
-  return runCommand('npx', [
+  const args = [
     'tsx',
     'src/agentic-loop-runner/index.ts',
     '--prompt',
     job.prompt,
-    '--success',
-    job.success_criteria,
     '--max-iterations',
     '1'
-  ]);
+  ];
+
+  if (job.success_criteria) {
+    args.push('--success', job.success_criteria);
+  }
+
+  return runCommand('npx', args);
 }
 
 async function executeJob(baseUrl: string, workerId: string, leaseTtlMs: number, job: JobRow): Promise<void> {

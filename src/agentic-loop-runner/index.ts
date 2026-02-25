@@ -12,7 +12,10 @@ type Config = {
   prompt: string;
   success?: string;
   maxIterations: number;
+  provider: Provider;
 };
+
+type Provider = 'codex' | 'claude';
 
 type ExecFailure = {
   kind: 'spawn_error' | 'command_not_found';
@@ -34,7 +37,7 @@ type GuardResult =
 function usage(): string {
   return [
     'Usage:',
-    '  npm run loop -- --prompt "..." --success "..." [--max-iterations 5]'
+    '  npm run loop -- --prompt "..." [--success "..."] [--max-iterations 5] [--provider codex|claude]'
   ].join('\n');
 }
 
@@ -58,9 +61,10 @@ function parseArgs(argv: string[]): Config {
 
   const prompt = args.get('--prompt');
   const success = args.get('--success');
+  const provider = args.get('--provider') ?? 'claude';
 
   if (!prompt) {
-    throw new Error('Both --prompt is required.');
+    throw new Error('--prompt is required.');
   }
 
   const maxIterationsRaw = args.get('--max-iterations') ?? '5';
@@ -70,7 +74,11 @@ function parseArgs(argv: string[]): Config {
     throw new Error('--max-iterations must be an integer >= 1');
   }
 
-  return { prompt, success, maxIterations };
+  if (provider !== 'codex' && provider !== 'claude') {
+    throw new Error('--provider must be one of: codex, claude');
+  }
+
+  return { prompt, success, maxIterations, provider };
 }
 
 function buildWorkerPrompt(basePrompt: string, feedback: string | null): string {
@@ -140,10 +148,10 @@ function parseGuardOutput(raw: string): GuardResult {
   };
 }
 
-function toExecFailure(error: unknown): ExecFailure {
+function toExecFailure(error: unknown, provider: Provider): ExecFailure {
   const errno = error as NodeJS.ErrnoException;
   if (errno?.code === 'ENOENT') {
-    return { kind: 'command_not_found', message: '`codex` command not found in PATH.' };
+    return { kind: 'command_not_found', message: `\`${provider}\` command not found in PATH.` };
   }
   return { kind: 'spawn_error', message: errno?.message ?? 'Failed to start process' };
 }
@@ -153,21 +161,40 @@ function terminateWithError(error: ExecFailure): never {
   process.exit(error.kind === 'command_not_found' ? 127 : 1);
 }
 
-function runWorker(prompt: string): Promise<WorkerResult> {
+function buildProviderCommand(provider: Provider, prompt: string): { command: string; args: string[]; stdin: string | null } {
+  if (provider === 'claude') {
+    return {
+      command: 'claude',
+      args: ['--dangerously-skip-permissions', '--print'],
+      stdin: prompt
+    };
+  }
+
+  return {
+    command: 'codex',
+    args: ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', prompt],
+    stdin: null
+  };
+}
+
+function runWorker(provider: Provider, prompt: string): Promise<WorkerResult> {
   return new Promise((resolve) => {
-    const child = spawn('codex', ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', prompt], {
-      stdio: 'inherit'
+    const cmd = buildProviderCommand(provider, prompt);
+    const child = spawn(cmd.command, cmd.args, {
+      stdio: ['pipe', 'inherit', 'inherit']
     });
 
-    child.on('error', (error) => resolve({ ok: false, error: toExecFailure(error) }));
+    child.on('error', (error) => resolve({ ok: false, error: toExecFailure(error, provider) }));
     child.on('close', (code) => resolve({ ok: true, code: code ?? 1 }));
+    child.stdin?.end(cmd.stdin ? `${cmd.stdin}\n` : undefined);
   });
 }
 
-function runJudge(judgePrompt: string): Promise<JudgeRunResult> {
+function runJudge(provider: Provider, judgePrompt: string): Promise<JudgeRunResult> {
   return new Promise((resolve) => {
-    const child = spawn('codex', ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', judgePrompt], {
-      stdio: ['ignore', 'pipe', 'pipe']
+    const cmd = buildProviderCommand(provider, judgePrompt);
+    const child = spawn(cmd.command, cmd.args, {
+      stdio: ['pipe', 'pipe', 'pipe']
     });
 
     let stdout = '';
@@ -181,10 +208,11 @@ function runJudge(judgePrompt: string): Promise<JudgeRunResult> {
       stderr += chunk.toString();
     });
 
-    child.on('error', (error) => resolve({ ok: false, error: toExecFailure(error) }));
+    child.on('error', (error) => resolve({ ok: false, error: toExecFailure(error, provider) }));
     child.on('close', (code) => {
       resolve({ ok: true, code: code ?? 1, stdout, stderr });
     });
+    child.stdin?.end(cmd.stdin ? `${cmd.stdin}\n` : undefined);
   });
 }
 
@@ -201,9 +229,9 @@ function buildContradictionGuardPrompt(prompt: string, success: string): string 
   ].join('\n');
 }
 
-async function runContradictionGuard(prompt: string, success: string): Promise<void> {
+async function runContradictionGuard(provider: Provider, prompt: string, success: string): Promise<void> {
   const guardPrompt = buildContradictionGuardPrompt(prompt, success);
-  const guardRun = await runJudge(guardPrompt);
+  const guardRun = await runJudge(provider, guardPrompt);
 
   if (!guardRun.ok) {
     terminateWithError(guardRun.error);
@@ -233,7 +261,7 @@ async function main(): Promise<void> {
 
   if (!config.success) {
     const workerPrompt = buildWorkerPrompt(config.prompt, null);
-    const workerRun = await runWorker(workerPrompt);
+    const workerRun = await runWorker(config.provider, workerPrompt);
     if (!workerRun.ok) {
       terminateWithError(workerRun.error);
     }
@@ -242,13 +270,13 @@ async function main(): Promise<void> {
   }
 
 
-  await runContradictionGuard(config.prompt, config.success);
+  await runContradictionGuard(config.provider, config.prompt, config.success);
 
   for (let i = 1; i <= config.maxIterations; i += 1) {
     console.log(`[Iteration ${i}/${config.maxIterations}] Judge start`);
     const judgePrompt = buildJudgePrompt(config.success);
 
-    const judgeResult = await runJudge(judgePrompt);
+    const judgeResult = await runJudge(config.provider, judgePrompt);
     if (!judgeResult.ok) {
       terminateWithError(judgeResult.error);
     }
@@ -273,7 +301,7 @@ async function main(): Promise<void> {
     const workerPrompt = buildWorkerPrompt(config.prompt, feedback);
     console.log(`[Iteration ${i}/${config.maxIterations}] Worker start`);
 
-    const workerRun = await runWorker(workerPrompt);
+    const workerRun = await runWorker(config.provider, workerPrompt);
     if (!workerRun.ok) {
       terminateWithError(workerRun.error);
     }
@@ -283,7 +311,7 @@ async function main(): Promise<void> {
   }
 
   console.log(`\n[Final Check] Judge start`);
-  const finalJudge = await runJudge(buildJudgePrompt(config.success));
+  const finalJudge = await runJudge(config.provider, buildJudgePrompt(config.success));
   if (!finalJudge.ok) {
     terminateWithError(finalJudge.error);
   }
