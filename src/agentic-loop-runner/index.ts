@@ -10,7 +10,7 @@ type JudgeDecision = {
 
 type Config = {
   prompt: string;
-  success: string;
+  success?: string;
   maxIterations: number;
 };
 
@@ -59,8 +59,8 @@ function parseArgs(argv: string[]): Config {
   const prompt = args.get('--prompt');
   const success = args.get('--success');
 
-  if (!prompt || !success) {
-    throw new Error('Both --prompt and --success are required.');
+  if (!prompt) {
+    throw new Error('Both --prompt is required.');
   }
 
   const maxIterationsRaw = args.get('--max-iterations') ?? '5';
@@ -156,7 +156,7 @@ function terminateWithError(error: ExecFailure): never {
 function runWorker(prompt: string): Promise<WorkerResult> {
   return new Promise((resolve) => {
     const child = spawn('codex', ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', prompt], {
-      stdio: 'inherit',
+      stdio: 'inherit'
     });
 
     child.on('error', (error) => resolve({ ok: false, error: toExecFailure(error) }));
@@ -229,6 +229,18 @@ async function main(): Promise<void> {
   }
 
   let feedback: string | null = null;
+
+
+  if (!config.success) {
+    const workerPrompt = buildWorkerPrompt(config.prompt, null);
+    const workerRun = await runWorker(workerPrompt);
+    if (!workerRun.ok) {
+      terminateWithError(workerRun.error);
+    }
+    const workerCode = workerRun.code;
+    process.exit(workerCode);
+  }
+
 
   await runContradictionGuard(config.prompt, config.success);
 
