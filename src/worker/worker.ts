@@ -3,8 +3,8 @@ import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadQueueConfig } from './config.js';
-import type { JobRow } from './types.js';
+import { loadWorkerConfig } from './config.js';
+import type { JobRow } from '../queue/types.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -16,6 +16,10 @@ type CommandResult = {
   spawnError: string | null;
 };
 
+type WorkerRuntimeOptions = {
+  streamJobLogs: boolean;
+};
+
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const RUNS_ROOT = resolve(PROJECT_ROOT, 'runs');
 const LOOP_RUNNER_PATH = resolve(PROJECT_ROOT, 'src', 'agentic-loop-runner', 'index.ts');
@@ -25,18 +29,40 @@ type LeaseResponse = {
   attempt_no?: number;
 };
 
-function runCommand(command: string, args: string[], cwd: string): Promise<CommandResult> {
+function runCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  onOutputLine?: (line: string) => void
+): Promise<CommandResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd });
 
     let output = '';
+    let lineBuffer = '';
+
+    const emitLines = (chunkText: string): void => {
+      if (!onOutputLine) {
+        return;
+      }
+      lineBuffer += chunkText;
+      const lines = lineBuffer.split(/\r?\n/);
+      lineBuffer = lines.pop() ?? '';
+      for (const line of lines) {
+        onOutputLine(line);
+      }
+    };
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      output += chunk.toString();
+      const text = chunk.toString();
+      output += text;
+      emitLines(text);
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      output += chunk.toString();
+      const text = chunk.toString();
+      output += text;
+      emitLines(text);
     });
 
     child.on('error', (error) => {
@@ -47,6 +73,9 @@ function runCommand(command: string, args: string[], cwd: string): Promise<Comma
     });
 
     child.on('close', (code) => {
+      if (onOutputLine && lineBuffer.length > 0) {
+        onOutputLine(lineBuffer);
+      }
       resolve({ exitCode: code, output, spawnError: null });
     });
   });
@@ -108,7 +137,12 @@ function createRunDir(runId: string): string {
   return runDir;
 }
 
-async function runJobViaExistingLoop(job: JobRow, runDir: string): Promise<CommandResult> {
+async function runJobViaExistingLoop(
+  job: JobRow,
+  runDir: string,
+  runId: string,
+  streamJobLogs: boolean
+): Promise<CommandResult> {
   const args = [
     'tsx',
     LOOP_RUNNER_PATH,
@@ -122,10 +156,22 @@ async function runJobViaExistingLoop(job: JobRow, runDir: string): Promise<Comma
     args.push('--success', job.success_criteria);
   }
 
-  return runCommand('npx', args, runDir);
+  const onOutputLine = streamJobLogs
+    ? (line: string) => {
+      console.log(`[RUN#${runId}]: ${line}`);
+    }
+    : undefined;
+
+  return runCommand('npx', args, runDir, onOutputLine);
 }
 
-async function executeJob(baseUrl: string, workerId: string, leaseTtlMs: number, job: JobRow): Promise<void> {
+async function executeJob(
+  baseUrl: string,
+  workerId: string,
+  leaseTtlMs: number,
+  job: JobRow,
+  options: WorkerRuntimeOptions
+): Promise<void> {
   const runId = `${job.id}-${Date.now()}`;
   const runDir = createRunDir(runId);
   const heartbeatTimer = setInterval(() => {
@@ -135,7 +181,7 @@ async function executeJob(baseUrl: string, workerId: string, leaseTtlMs: number,
   }, Math.max(1000, Math.floor(leaseTtlMs / 3)));
 
   try {
-    const result = await runJobViaExistingLoop(job, runDir);
+    const result = await runJobViaExistingLoop(job, runDir, runId, options.streamJobLogs);
     const outputWithRunDir = `RUN_DIR=${runDir}\n\n${result.output}`;
 
     let judgeDecision: 'YES' | 'NO' | null = null;
@@ -185,8 +231,8 @@ async function executeJob(baseUrl: string, workerId: string, leaseTtlMs: number,
   }
 }
 
-export async function startQueueWorker(): Promise<void> {
-  const config = loadQueueConfig();
+export async function startQueueWorker(options: WorkerRuntimeOptions = { streamJobLogs: false }): Promise<void> {
+  const config = loadWorkerConfig();
   const workerId = `worker-${randomUUID()}`;
 
   console.log(`[queue-worker] started: ${workerId}`);
@@ -201,7 +247,7 @@ export async function startQueueWorker(): Promise<void> {
       }
 
       console.log(`[queue-worker] leased job ${job.id}`);
-      await executeJob(config.apiBaseUrl, workerId, config.leaseTtlMs, job);
+      await executeJob(config.apiBaseUrl, workerId, config.leaseTtlMs, job, options);
     } catch (error) {
       console.error(`[queue-worker] API error: ${error instanceof Error ? error.message : String(error)}`);
       await sleep(config.pollMs);

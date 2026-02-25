@@ -48,6 +48,12 @@ Default: `http://localhost:7070`
 npm run queue:worker
 ```
 
+With per-run live logs streamed from `agentic-loop`:
+
+```bash
+npm run queue:worker -- --stream-job-logs
+```
+
 ### REST API
 
 - `POST /jobs`
@@ -60,11 +66,15 @@ npm run queue:worker
 - `POST /jobs/:id/heartbeat` (worker endpoint)
 - `POST /jobs/:id/complete` (worker endpoint)
 
-### Environment variables
+### Gateway env vars
 
 - `QUEUE_DB_PATH` (default `./data/queue.sqlite`)
-- `QUEUE_POLL_MS` (default `2000`)
 - `QUEUE_LEASE_TTL_MS` (default `120000`)
 - `QUEUE_MAX_ATTEMPTS` (default `3`)
 - `QUEUE_API_PORT` (default `7070`)
-- `QUEUE_API_BASE_URL` (default `http://localhost:7070`, used by worker)
+
+### Worker env vars
+
+- `WORKER_API_BASE_URL` (default `http://localhost:7070`)
+- `WORKER_POLL_MS` (default `2000`)
+- `WORKER_LEASE_TTL_MS` (default `120000`)
