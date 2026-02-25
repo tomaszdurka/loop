@@ -115,7 +115,7 @@ export function startQueueApi(): void {
         const workerId = typeof body.worker_id === 'string' ? body.worker_id.trim() : '';
         const leaseTtlMs = Number.isInteger(body.lease_ttl_ms)
           ? Number(body.lease_ttl_ms)
-          : config.leaseTtlMs;
+          : config.defaultLeaseTtlMs;
 
         if (!workerId) {
           sendJson(res, 400, { error: 'worker_id is required' });
@@ -182,7 +182,7 @@ export function startQueueApi(): void {
         const workerId = typeof body.worker_id === 'string' ? body.worker_id.trim() : '';
         const leaseTtlMs = Number.isInteger(body.lease_ttl_ms)
           ? Number(body.lease_ttl_ms)
-          : config.leaseTtlMs;
+          : config.defaultLeaseTtlMs;
 
         if (!workerId) {
           sendJson(res, 400, { error: 'worker_id is required' });
@@ -195,6 +195,44 @@ export function startQueueApi(): void {
 
         repo.heartbeatLease(id, workerId, leaseTtlMs);
         sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      const leaseByIdMatch = url.pathname.match(/^\/jobs\/([^/]+)\/lease$/);
+      if (method === 'POST' && leaseByIdMatch) {
+        const id = decodeURIComponent(leaseByIdMatch[1]);
+        const body = await readJsonBody(req) as { worker_id?: unknown; lease_ttl_ms?: unknown };
+        const workerId = typeof body.worker_id === 'string' ? body.worker_id.trim() : '';
+        const leaseTtlMs = Number.isInteger(body.lease_ttl_ms)
+          ? Number(body.lease_ttl_ms)
+          : config.defaultLeaseTtlMs;
+
+        if (!workerId) {
+          sendJson(res, 400, { error: 'worker_id is required' });
+          return;
+        }
+        if (!Number.isInteger(leaseTtlMs) || leaseTtlMs <= 0) {
+          sendJson(res, 400, { error: 'lease_ttl_ms must be a positive integer when provided' });
+          return;
+        }
+
+        const job = repo.leaseJobById(id, workerId, leaseTtlMs);
+        if (!job) {
+          sendJson(res, 409, { error: 'job is not available for lease' });
+          return;
+        }
+
+        const startedAttempt = repo.startAttempt(job.id, workerId);
+        if (startedAttempt === 0) {
+          sendJson(res, 409, { error: 'failed to start attempt for leased job' });
+          return;
+        }
+
+        const leasedJob = repo.getJobById(job.id);
+        sendJson(res, 200, {
+          job: leasedJob ? toApiJob(leasedJob) : toApiJob(job),
+          attempt_no: startedAttempt
+        });
         return;
       }
 

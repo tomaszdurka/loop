@@ -138,6 +138,33 @@ export class QueueRepository {
     return tx();
   }
 
+  leaseJobById(jobId: string, workerId: string, leaseTtlMs: number): JobRow | null {
+    const tx = this.db.transaction(() => {
+      this.recoverExpiredLeases();
+
+      const now = nowIso();
+      const leaseExpiresAt = new Date(Date.now() + leaseTtlMs).toISOString();
+      const claimed = this.db
+        .prepare(
+          `UPDATE jobs SET
+             status = 'leased',
+             lease_owner = ?,
+             lease_expires_at = ?,
+             updated_at = ?
+           WHERE id = ? AND status = 'queued'`
+        )
+        .run(workerId, leaseExpiresAt, now, jobId);
+
+      if (claimed.changes !== 1) {
+        return null;
+      }
+
+      return this.getJobById(jobId);
+    });
+
+    return tx();
+  }
+
   startAttempt(jobId: string, workerId: string): number {
     const tx = this.db.transaction(() => {
       const job = this.db

@@ -1,14 +1,12 @@
-import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadWorkerConfig } from './config.js';
 import type { JobRow } from '../queue/types.js';
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+export type WorkerRuntimeOptions = {
+  streamJobLogs: boolean;
+};
 
 type CommandResult = {
   exitCode: number | null;
@@ -16,18 +14,14 @@ type CommandResult = {
   spawnError: string | null;
 };
 
-type WorkerRuntimeOptions = {
-  streamJobLogs: boolean;
-};
-
-const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const RUNS_ROOT = resolve(PROJECT_ROOT, 'runs');
-const LOOP_RUNNER_PATH = resolve(PROJECT_ROOT, 'src', 'agentic-loop-runner', 'index.ts');
-
 type LeaseResponse = {
   job: JobRow | null;
   attempt_no?: number;
 };
+
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const RUNS_ROOT = resolve(PROJECT_ROOT, 'runs');
+const LOOP_ENTRYPOINT = resolve(PROJECT_ROOT, 'src', 'loop.ts');
 
 function runCommand(
   command: string,
@@ -101,8 +95,16 @@ async function postJson<T>(baseUrl: string, path: string, body: unknown): Promis
   return parsed as T;
 }
 
-async function leaseJob(baseUrl: string, workerId: string, leaseTtlMs: number): Promise<JobRow | null> {
+export async function leaseNextJob(baseUrl: string, workerId: string, leaseTtlMs: number): Promise<JobRow | null> {
   const leased = await postJson<LeaseResponse>(baseUrl, '/jobs/lease', {
+    worker_id: workerId,
+    lease_ttl_ms: leaseTtlMs
+  });
+  return leased.job;
+}
+
+export async function leaseJobById(baseUrl: string, workerId: string, leaseTtlMs: number, jobId: string): Promise<JobRow | null> {
+  const leased = await postJson<LeaseResponse>(baseUrl, `/jobs/${encodeURIComponent(jobId)}/lease`, {
     worker_id: workerId,
     lease_ttl_ms: leaseTtlMs
   });
@@ -145,9 +147,11 @@ async function runJobViaExistingLoop(
 ): Promise<CommandResult> {
   const args = [
     'tsx',
-    LOOP_RUNNER_PATH,
-    '--prompt',
+    LOOP_ENTRYPOINT,
+    'run',
     job.prompt,
+    '--cwd',
+    runDir,
     '--max-iterations',
     '1'
   ];
@@ -165,13 +169,13 @@ async function runJobViaExistingLoop(
   return runCommand('npx', args, runDir, onOutputLine);
 }
 
-async function executeJob(
+export async function runLeasedJob(
   baseUrl: string,
   workerId: string,
   leaseTtlMs: number,
   job: JobRow,
   options: WorkerRuntimeOptions
-): Promise<void> {
+): Promise<boolean> {
   const runId = `${job.id}-${Date.now()}`;
   const runDir = createRunDir(runId);
   const heartbeatTimer = setInterval(() => {
@@ -215,6 +219,7 @@ async function executeJob(
     });
 
     console.log(`[queue-worker] job ${job.id} ${succeeded ? 'succeeded' : 'failed_or_requeued'}`);
+    return succeeded;
   } catch (error) {
     await complete(baseUrl, workerId, job.id, {
       worker_exit_code: null,
@@ -226,31 +231,8 @@ async function executeJob(
       finished_at: new Date().toISOString()
     });
     console.error(`[queue-worker] job ${job.id} runtime error`);
+    return false;
   } finally {
     clearInterval(heartbeatTimer);
-  }
-}
-
-export async function startQueueWorker(options: WorkerRuntimeOptions = { streamJobLogs: false }): Promise<void> {
-  const config = loadWorkerConfig();
-  const workerId = `worker-${randomUUID()}`;
-
-  console.log(`[queue-worker] started: ${workerId}`);
-  console.log(`[queue-worker] api: ${config.apiBaseUrl}`);
-
-  while (true) {
-    try {
-      const job = await leaseJob(config.apiBaseUrl, workerId, config.leaseTtlMs);
-      if (!job) {
-        await sleep(config.pollMs);
-        continue;
-      }
-
-      console.log(`[queue-worker] leased job ${job.id}`);
-      await executeJob(config.apiBaseUrl, workerId, config.leaseTtlMs, job, options);
-    } catch (error) {
-      console.error(`[queue-worker] API error: ${error instanceof Error ? error.message : String(error)}`);
-      await sleep(config.pollMs);
-    }
   }
 }

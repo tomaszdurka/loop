@@ -8,16 +8,17 @@ Minimal TypeScript CLI loop around `codex exec`.
 npm install
 ```
 
-## Run
+## Loop CLI
 
 ```bash
-npm run loop -- --prompt "Implement X" --success "All tests pass and file Y exists"
+npm run loop -- run "Implement X" --success "All tests pass and file Y exists"
 ```
 
 Optional flags:
 
 - `--max-iterations 5`
 - `--provider codex|claude` (default `codex`)
+- `--cwd /abs/or/relative/path` (default current working directory)
 
 The script:
 
@@ -34,10 +35,10 @@ Both worker and judge runs use:
 
 This project also includes a local queue gateway + worker backed by SQLite.
 
-### Start API
+### Start Gateway
 
 ```bash
-npm run queue:api
+npm run loop -- gateway
 ```
 
 Default: `http://localhost:7070`
@@ -45,13 +46,19 @@ Default: `http://localhost:7070`
 ### Start Worker
 
 ```bash
-npm run queue:worker
+npm run loop -- worker
 ```
 
 With per-run live logs streamed from `agentic-loop`:
 
 ```bash
-npm run queue:worker -- --stream-job-logs
+npm run loop -- worker --stream-job-logs
+```
+
+Run one specific queued job by ID:
+
+```bash
+npm run loop -- run-job <job_id>
 ```
 
 ### REST API
@@ -63,6 +70,7 @@ npm run queue:worker -- --stream-job-logs
 - `GET /jobs/:id`
 - `GET /jobs?status=queued|leased|running|succeeded|failed`
 - `POST /jobs/lease` (worker endpoint)
+- `POST /jobs/:id/lease` (worker endpoint for explicit job ID)
 - `POST /jobs/:id/heartbeat` (worker endpoint)
 - `POST /jobs/:id/complete` (worker endpoint)
 

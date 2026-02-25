@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import { spawn } from 'node:child_process';
 
 type JudgeDecision = {
@@ -8,11 +6,12 @@ type JudgeDecision = {
   raw: string;
 };
 
-type Config = {
+export type AgenticLoopConfig = {
   prompt: string;
   success?: string;
   maxIterations: number;
   provider: Provider;
+  cwd: string;
 };
 
 type Provider = 'codex' | 'claude';
@@ -33,53 +32,6 @@ type JudgeRunResult =
 type GuardResult =
   | { ok: true }
   | { ok: false; reason: string };
-
-function usage(): string {
-  return [
-    'Usage:',
-    '  npm run loop -- --prompt "..." [--success "..."] [--max-iterations 5] [--provider codex|claude]'
-  ].join('\n');
-}
-
-function parseArgs(argv: string[]): Config {
-  const args = new Map<string, string>();
-
-  for (let i = 0; i < argv.length; i += 1) {
-    const token = argv[i];
-    if (!token.startsWith('--')) {
-      continue;
-    }
-
-    const value = argv[i + 1];
-    if (!value || value.startsWith('--')) {
-      throw new Error(`Missing value for ${token}`);
-    }
-
-    args.set(token, value);
-    i += 1;
-  }
-
-  const prompt = args.get('--prompt');
-  const success = args.get('--success');
-  const provider = args.get('--provider') ?? 'claude';
-
-  if (!prompt) {
-    throw new Error('--prompt is required.');
-  }
-
-  const maxIterationsRaw = args.get('--max-iterations') ?? '5';
-  const maxIterations = Number(maxIterationsRaw);
-
-  if (!Number.isInteger(maxIterations) || maxIterations < 1) {
-    throw new Error('--max-iterations must be an integer >= 1');
-  }
-
-  if (provider !== 'codex' && provider !== 'claude') {
-    throw new Error('--provider must be one of: codex, claude');
-  }
-
-  return { prompt, success, maxIterations, provider };
-}
 
 function buildWorkerPrompt(basePrompt: string, feedback: string | null): string {
   if (!feedback) {
@@ -177,11 +129,12 @@ function buildProviderCommand(provider: Provider, prompt: string): { command: st
   };
 }
 
-function runWorker(provider: Provider, prompt: string): Promise<WorkerResult> {
+function runWorker(provider: Provider, prompt: string, cwd: string): Promise<WorkerResult> {
   return new Promise((resolve) => {
     const cmd = buildProviderCommand(provider, prompt);
     const child = spawn(cmd.command, cmd.args, {
-      stdio: ['pipe', 'inherit', 'inherit']
+      stdio: ['pipe', 'inherit', 'inherit'],
+      cwd
     });
 
     child.on('error', (error) => resolve({ ok: false, error: toExecFailure(error, provider) }));
@@ -190,11 +143,12 @@ function runWorker(provider: Provider, prompt: string): Promise<WorkerResult> {
   });
 }
 
-function runJudge(provider: Provider, judgePrompt: string): Promise<JudgeRunResult> {
+function runJudge(provider: Provider, judgePrompt: string, cwd: string): Promise<JudgeRunResult> {
   return new Promise((resolve) => {
     const cmd = buildProviderCommand(provider, judgePrompt);
     const child = spawn(cmd.command, cmd.args, {
-      stdio: ['pipe', 'pipe', 'pipe']
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd
     });
 
     let stdout = '';
@@ -229,9 +183,9 @@ function buildContradictionGuardPrompt(prompt: string, success: string): string 
   ].join('\n');
 }
 
-async function runContradictionGuard(provider: Provider, prompt: string, success: string): Promise<void> {
+async function runContradictionGuard(provider: Provider, prompt: string, success: string, cwd: string): Promise<void> {
   const guardPrompt = buildContradictionGuardPrompt(prompt, success);
-  const guardRun = await runJudge(provider, guardPrompt);
+  const guardRun = await runJudge(provider, guardPrompt, cwd);
 
   if (!guardRun.ok) {
     terminateWithError(guardRun.error);
@@ -244,24 +198,13 @@ async function runContradictionGuard(provider: Provider, prompt: string, success
   }
 }
 
-async function main(): Promise<void> {
-  let config: Config;
-
-  try {
-    config = parseArgs(process.argv.slice(2));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Invalid arguments';
-    console.error(message);
-    console.error(usage());
-    process.exit(2);
-  }
-
+export async function runAgenticLoopCommand(config: AgenticLoopConfig): Promise<void> {
   let feedback: string | null = null;
 
 
   if (!config.success) {
     const workerPrompt = buildWorkerPrompt(config.prompt, null);
-    const workerRun = await runWorker(config.provider, workerPrompt);
+    const workerRun = await runWorker(config.provider, workerPrompt, config.cwd);
     if (!workerRun.ok) {
       terminateWithError(workerRun.error);
     }
@@ -270,13 +213,13 @@ async function main(): Promise<void> {
   }
 
 
-  await runContradictionGuard(config.provider, config.prompt, config.success);
+  await runContradictionGuard(config.provider, config.prompt, config.success, config.cwd);
 
   for (let i = 1; i <= config.maxIterations; i += 1) {
     console.log(`[Iteration ${i}/${config.maxIterations}] Judge start`);
     const judgePrompt = buildJudgePrompt(config.success);
 
-    const judgeResult = await runJudge(config.provider, judgePrompt);
+    const judgeResult = await runJudge(config.provider, judgePrompt, config.cwd);
     if (!judgeResult.ok) {
       terminateWithError(judgeResult.error);
     }
@@ -301,7 +244,7 @@ async function main(): Promise<void> {
     const workerPrompt = buildWorkerPrompt(config.prompt, feedback);
     console.log(`[Iteration ${i}/${config.maxIterations}] Worker start`);
 
-    const workerRun = await runWorker(config.provider, workerPrompt);
+    const workerRun = await runWorker(config.provider, workerPrompt, config.cwd);
     if (!workerRun.ok) {
       terminateWithError(workerRun.error);
     }
@@ -311,7 +254,7 @@ async function main(): Promise<void> {
   }
 
   console.log(`\n[Final Check] Judge start`);
-  const finalJudge = await runJudge(config.provider, buildJudgePrompt(config.success));
+  const finalJudge = await runJudge(config.provider, buildJudgePrompt(config.success), config.cwd);
   if (!finalJudge.ok) {
     terminateWithError(finalJudge.error);
   }
@@ -329,8 +272,3 @@ async function main(): Promise<void> {
   console.error(`\nMax iterations reached (${config.maxIterations}) without success.`);
   process.exit(1);
 }
-
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});

@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "loop": "npx tsx src/agentic-loop-runner/index.ts",
-    "queue:api": "npx tsx src/gateway/index.ts",
-    "queue:worker": "npx tsx src/worker/index.ts",
+    "loop": "npx tsx src/loop.ts",
+    "queue:api": "npm run loop -- gateway",
+    "queue:worker": "npm run loop -- worker",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
