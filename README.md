@@ -55,6 +55,9 @@ npm run queue:worker
     - `success_criteria` (optional; if present, worker runs judge step)
 - `GET /jobs/:id`
 - `GET /jobs?status=queued|leased|running|succeeded|failed`
+- `POST /jobs/lease` (worker endpoint)
+- `POST /jobs/:id/heartbeat` (worker endpoint)
+- `POST /jobs/:id/complete` (worker endpoint)
 
 ### Environment variables
 
@@ -63,3 +66,4 @@ npm run queue:worker
 - `QUEUE_LEASE_TTL_MS` (default `120000`)
 - `QUEUE_MAX_ATTEMPTS` (default `3`)
 - `QUEUE_API_PORT` (default `7070`)
+- `QUEUE_API_BASE_URL` (default `http://localhost:7070`, used by worker)

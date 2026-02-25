@@ -73,11 +73,11 @@ export class QueueRepository {
           .prepare(
             `INSERT INTO job_attempts (
               job_id, attempt_no, status, worker_exit_code, judge_decision,
-              judge_explanation, stdout, stderr, started_at, finished_at
-            ) VALUES (?, ?, 'failed', NULL, NULL, NULL, '', ?, ?, ?)
+              judge_explanation, output, started_at, finished_at
+            ) VALUES (?, ?, 'failed', NULL, NULL, NULL, ?, ?, ?)
             ON CONFLICT(job_id, attempt_no) DO UPDATE SET
               status='failed',
-              stderr=excluded.stderr,
+              output=excluded.output,
               finished_at=excluded.finished_at`
           )
           .run(job.id, nextAttempt, message, now, now);
@@ -159,8 +159,8 @@ export class QueueRepository {
         .prepare(
           `INSERT INTO job_attempts (
             job_id, attempt_no, status, worker_exit_code, judge_decision,
-            judge_explanation, stdout, stderr, started_at, finished_at
-          ) VALUES (?, ?, 'running', NULL, NULL, NULL, '', '', ?, NULL)
+            judge_explanation, output, started_at, finished_at
+          ) VALUES (?, ?, 'running', NULL, NULL, NULL, '', ?, NULL)
           ON CONFLICT(job_id, attempt_no) DO UPDATE SET
             status='running',
             started_at=excluded.started_at,
@@ -208,15 +208,14 @@ export class QueueRepository {
         .prepare(
           `INSERT INTO job_attempts (
              job_id, attempt_no, status, worker_exit_code, judge_decision,
-             judge_explanation, stdout, stderr, started_at, finished_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             judge_explanation, output, started_at, finished_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(job_id, attempt_no) DO UPDATE SET
              status=excluded.status,
              worker_exit_code=excluded.worker_exit_code,
              judge_decision=excluded.judge_decision,
              judge_explanation=excluded.judge_explanation,
-             stdout=excluded.stdout,
-             stderr=excluded.stderr,
+             output=excluded.output,
              finished_at=excluded.finished_at`
         )
         .run(
@@ -226,8 +225,7 @@ export class QueueRepository {
           result.workerExitCode,
           result.judgeDecision,
           result.judgeExplanation,
-          result.stdout,
-          result.stderr,
+          result.output,
           result.finishedAt,
           result.finishedAt
         );

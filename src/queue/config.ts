@@ -4,6 +4,7 @@ export type QueueConfig = {
   leaseTtlMs: number;
   maxAttempts: number;
   apiPort: number;
+  apiBaseUrl: string;
 };
 
 function intFromEnv(name: string, fallback: number): number {
@@ -19,11 +20,14 @@ function intFromEnv(name: string, fallback: number): number {
 }
 
 export function loadQueueConfig(): QueueConfig {
+  const apiBaseUrlRaw = process.env.QUEUE_API_BASE_URL ?? 'http://localhost:7070';
+  const apiBaseUrl = apiBaseUrlRaw.replace(/\/+$/, '');
   return {
     dbPath: process.env.QUEUE_DB_PATH ?? './data/queue.sqlite',
     pollMs: intFromEnv('QUEUE_POLL_MS', 2000),
     leaseTtlMs: intFromEnv('QUEUE_LEASE_TTL_MS', 120000),
     maxAttempts: intFromEnv('QUEUE_MAX_ATTEMPTS', 3),
-    apiPort: intFromEnv('QUEUE_API_PORT', 7070)
+    apiPort: intFromEnv('QUEUE_API_PORT', 7070),
+    apiBaseUrl
   };
 }

@@ -28,8 +28,7 @@ export function initSchema(db: Database.Database): void {
       worker_exit_code INTEGER,
       judge_decision TEXT,
       judge_explanation TEXT,
-      stdout TEXT NOT NULL,
-      stderr TEXT NOT NULL,
+      output TEXT NOT NULL,
       started_at TEXT NOT NULL,
       finished_at TEXT,
       FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE,
@@ -38,4 +37,32 @@ export function initSchema(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_job_attempts_job_id_attempt_no ON job_attempts(job_id, attempt_no);
   `);
+
+  // Backward-compatible migration for older local DBs that used stdout/stderr columns.
+  const columns = db.prepare(`PRAGMA table_info(job_attempts)`).all() as Array<{ name: string }>;
+  const hasOutput = columns.some((column) => column.name === 'output');
+  const hasStdout = columns.some((column) => column.name === 'stdout');
+  const hasStderr = columns.some((column) => column.name === 'stderr');
+  if (!hasOutput) {
+    db.exec(`ALTER TABLE job_attempts ADD COLUMN output TEXT NOT NULL DEFAULT ''`);
+  }
+  if (hasStdout || hasStderr) {
+    db.exec(`
+      UPDATE job_attempts
+      SET output = TRIM(
+        COALESCE(output, '') ||
+        CASE
+          WHEN COALESCE(output, '') <> '' AND COALESCE(stdout, '') <> '' THEN CHAR(10)
+          ELSE ''
+        END ||
+        COALESCE(stdout, '') ||
+        CASE
+          WHEN (COALESCE(output, '') <> '' OR COALESCE(stdout, '') <> '') AND COALESCE(stderr, '') <> '' THEN CHAR(10)
+          ELSE ''
+        END ||
+        COALESCE(stderr, '')
+      )
+      WHERE COALESCE(output, '') = '';
+    `);
+  }
 }

@@ -24,8 +24,7 @@ export type JobAttemptRow = {
   worker_exit_code: number | null;
   judge_decision: JudgeDecisionValue;
   judge_explanation: string | null;
-  stdout: string;
-  stderr: string;
+  output: string;
   started_at: string;
   finished_at: string | null;
 };
@@ -39,8 +38,7 @@ export type CompleteAttemptInput = {
   workerExitCode: number | null;
   judgeDecision: JudgeDecisionValue;
   judgeExplanation: string | null;
-  stdout: string;
-  stderr: string;
+  output: string;
   succeeded: boolean;
   errorMessage: string | null;
   finishedAt: string;
