@@ -1,6 +1,13 @@
-# agentic-loop
+# loop
 
-Minimal TypeScript CLI loop around `codex exec`.
+`loop` is a small orchestration tool with two layers:
+
+1. `loop run`:
+   - runs an agent prompt repeatedly (optionally with a success criteria judge)
+   - stops on success or max iterations
+2. queue system:
+   - `loop gateway` exposes API for queuing/listing/leasing jobs
+   - `loop worker` pulls queued jobs and executes them via `loop run-job` -> `loop run`
 
 ## Install
 
@@ -8,81 +15,69 @@ Minimal TypeScript CLI loop around `codex exec`.
 npm install
 ```
 
-## Loop CLI
+## Commands
+
+- `loop gateway`
+- `loop run "<prompt>" [--success "..."] [--provider codex|claude] [--max-iterations N] [--cwd "/path"]`
+- `loop run-job <job-id> [--stream-job-logs]`
+- `loop worker [--stream-job-logs]`
+
+Equivalent via npm:
 
 ```bash
-npm run loop -- run "Implement X" --success "All tests pass and file Y exists"
+npm run loop -- <command...>
 ```
 
-Optional flags:
+## Quick Flow
 
-- `--max-iterations 5`
-- `--provider codex|claude` (default `codex`)
-- `--cwd /abs/or/relative/path` (default current working directory)
-
-The script:
-
-1. Runs a worker `codex exec`.
-2. Runs a separate judge `codex exec` that inspects the workspace and returns `YES:` or `NO:`.
-3. Retries with prior judge feedback until success or max iterations.
-
-Both worker and judge runs use:
-
-- `--dangerously-bypass-approvals-and-sandbox`
-- `--skip-git-repo-check`
-
-## Queue Service
-
-This project also includes a local queue gateway + worker backed by SQLite.
-
-### Start Gateway
+1. Start gateway (terminal A):
 
 ```bash
 npm run loop -- gateway
 ```
 
-Default: `http://localhost:7070`
-
-### Start Worker
-
-```bash
-npm run loop -- worker
-```
-
-With per-run live logs streamed from `agentic-loop`:
+2. Start worker (terminal B):
 
 ```bash
 npm run loop -- worker --stream-job-logs
 ```
 
-Run one specific queued job by ID:
+3. Queue a job (terminal C):
 
 ```bash
-npm run loop -- run-job <job_id>
+curl -sS -X POST http://localhost:7070/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Implement feature X",
+    "success_criteria": "File src/x.ts exists and tests pass"
+  }'
 ```
 
-### REST API
+4. Check job status:
 
-- `POST /jobs`
-  - Body:
-    - `prompt` (required)
-    - `success_criteria` (optional; if present, worker runs judge step)
+```bash
+curl -sS http://localhost:7070/jobs/<job_id>
+```
+
+## REST API
+
+- `POST /jobs` (`prompt` required, `success_criteria` optional)
 - `GET /jobs/:id`
 - `GET /jobs?status=queued|leased|running|succeeded|failed`
-- `POST /jobs/lease` (worker endpoint)
-- `POST /jobs/:id/lease` (worker endpoint for explicit job ID)
-- `POST /jobs/:id/heartbeat` (worker endpoint)
-- `POST /jobs/:id/complete` (worker endpoint)
+- `POST /jobs/lease`
+- `POST /jobs/:id/lease`
+- `POST /jobs/:id/heartbeat`
+- `POST /jobs/:id/complete`
 
-### Gateway env vars
+## Env Vars
 
+Gateway:
 - `QUEUE_DB_PATH` (default `./data/queue.sqlite`)
 - `QUEUE_LEASE_TTL_MS` (default `120000`)
 - `QUEUE_MAX_ATTEMPTS` (default `3`)
 - `QUEUE_API_PORT` (default `7070`)
 
-### Worker env vars
-
+Worker:
 - `WORKER_API_BASE_URL` (default `http://localhost:7070`)
 - `WORKER_POLL_MS` (default `2000`)
 - `WORKER_LEASE_TTL_MS` (default `120000`)
