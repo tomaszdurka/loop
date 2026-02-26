@@ -4,3 +4,6 @@ data/
 runs/
 .agents
 *.log
+
+
+.idea/
