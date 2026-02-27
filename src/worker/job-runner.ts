@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { JobRow } from '../queue/types.js';
+import type { TaskRow } from '../queue/types.js';
 
 export type WorkerRuntimeOptions = {
   streamJobLogs: boolean;
@@ -15,7 +15,7 @@ type CommandResult = {
 };
 
 type LeaseResponse = {
-  job: JobRow | null;
+  task: TaskRow | null;
   attempt_no?: number;
 };
 
@@ -95,30 +95,30 @@ async function postJson<T>(baseUrl: string, path: string, body: unknown): Promis
   return parsed as T;
 }
 
-export async function leaseNextJob(baseUrl: string, workerId: string, leaseTtlMs: number): Promise<JobRow | null> {
-  const leased = await postJson<LeaseResponse>(baseUrl, '/jobs/lease', {
+export async function leaseNextJob(baseUrl: string, workerId: string, leaseTtlMs: number): Promise<TaskRow | null> {
+  const leased = await postJson<LeaseResponse>(baseUrl, '/tasks/lease', {
     worker_id: workerId,
     lease_ttl_ms: leaseTtlMs
   });
-  return leased.job;
+  return leased.task;
 }
 
-export async function leaseJobById(baseUrl: string, workerId: string, leaseTtlMs: number, jobId: string): Promise<JobRow | null> {
-  const leased = await postJson<LeaseResponse>(baseUrl, `/jobs/${encodeURIComponent(jobId)}/lease`, {
+export async function leaseJobById(baseUrl: string, workerId: string, leaseTtlMs: number, jobId: string): Promise<TaskRow | null> {
+  const leased = await postJson<LeaseResponse>(baseUrl, `/tasks/${encodeURIComponent(jobId)}/lease`, {
     worker_id: workerId,
     lease_ttl_ms: leaseTtlMs
   });
-  return leased.job;
+  return leased.task;
 }
 
-async function heartbeat(baseUrl: string, workerId: string, jobId: string, leaseTtlMs: number): Promise<void> {
-  await postJson(baseUrl, `/jobs/${encodeURIComponent(jobId)}/heartbeat`, {
+async function heartbeat(baseUrl: string, workerId: string, taskId: string, leaseTtlMs: number): Promise<void> {
+  await postJson(baseUrl, `/tasks/${encodeURIComponent(taskId)}/heartbeat`, {
     worker_id: workerId,
     lease_ttl_ms: leaseTtlMs
   });
 }
 
-async function complete(baseUrl: string, workerId: string, jobId: string, payload: {
+async function complete(baseUrl: string, workerId: string, taskId: string, payload: {
   worker_exit_code: number | null;
   judge_decision: 'YES' | 'NO' | null;
   judge_explanation: string | null;
@@ -127,7 +127,7 @@ async function complete(baseUrl: string, workerId: string, jobId: string, payloa
   error_message: string | null;
   finished_at: string;
 }): Promise<void> {
-  await postJson(baseUrl, `/jobs/${encodeURIComponent(jobId)}/complete`, {
+  await postJson(baseUrl, `/tasks/${encodeURIComponent(taskId)}/complete`, {
     worker_id: workerId,
     ...payload
   });
@@ -145,7 +145,7 @@ function createRunDir(runId: string): string {
 }
 
 async function runJobViaExistingLoop(
-  job: JobRow,
+  task: TaskRow,
   runDir: string,
   runId: string,
   streamJobLogs: boolean
@@ -154,15 +154,15 @@ async function runJobViaExistingLoop(
     'tsx',
     LOOP_ENTRYPOINT,
     'run',
-    job.prompt,
+    task.prompt,
     '--cwd',
     runDir,
     '--max-iterations',
     '1'
   ];
 
-  if (job.success_criteria) {
-    args.push('--success', job.success_criteria);
+  if (task.success_criteria) {
+    args.push('--success', task.success_criteria);
   }
 
   const onOutputLine = streamJobLogs
@@ -178,25 +178,25 @@ export async function runLeasedJob(
   baseUrl: string,
   workerId: string,
   leaseTtlMs: number,
-  job: JobRow,
+  task: TaskRow,
   options: WorkerRuntimeOptions
 ): Promise<boolean> {
-  const runId = `${job.id}-${Date.now()}`;
+  const runId = `${task.id}-${Date.now()}`;
   const runDir = createRunDir(runId);
   const heartbeatTimer = setInterval(() => {
-    heartbeat(baseUrl, workerId, job.id, leaseTtlMs).catch((error) => {
-      console.error(`[queue-worker] heartbeat failed for ${job.id}: ${error instanceof Error ? error.message : String(error)}`);
+    heartbeat(baseUrl, workerId, task.id, leaseTtlMs).catch((error) => {
+      console.error(`[queue-worker] heartbeat failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
     });
   }, Math.max(1000, Math.floor(leaseTtlMs / 3)));
 
   try {
-    const result = await runJobViaExistingLoop(job, runDir, runId, options.streamJobLogs);
+    const result = await runJobViaExistingLoop(task, runDir, runId, options.streamJobLogs);
     const outputWithRunDir = `RUN_DIR=${runDir}\n\n${result.output}`;
 
     let judgeDecision: 'YES' | 'NO' | null = null;
     let judgeExplanation: string | null = null;
 
-    if (job.success_criteria) {
+    if (task.success_criteria) {
       const text = result.output;
       if (/Judge decision:\s*YES/i.test(text)) {
         judgeDecision = 'YES';
@@ -213,7 +213,7 @@ export async function runLeasedJob(
       ? null
       : (result.spawnError ?? `Runner exit code ${result.exitCode ?? 'null'}`);
 
-    await complete(baseUrl, workerId, job.id, {
+    await complete(baseUrl, workerId, task.id, {
       worker_exit_code: result.exitCode,
       judge_decision: judgeDecision,
       judge_explanation: judgeExplanation,
@@ -223,10 +223,10 @@ export async function runLeasedJob(
       finished_at: new Date().toISOString()
     });
 
-    console.log(`[queue-worker] job ${job.id} ${succeeded ? 'succeeded' : 'failed_or_requeued'}`);
+    console.log(`[queue-worker] task ${task.id} ${succeeded ? 'done' : 'failed_or_requeued'}`);
     return succeeded;
   } catch (error) {
-    await complete(baseUrl, workerId, job.id, {
+    await complete(baseUrl, workerId, task.id, {
       worker_exit_code: null,
       judge_decision: 'NO',
       judge_explanation: 'Worker runtime error',
@@ -235,7 +235,7 @@ export async function runLeasedJob(
       error_message: 'Worker runtime error',
       finished_at: new Date().toISOString()
     });
-    console.error(`[queue-worker] job ${job.id} runtime error`);
+    console.error(`[queue-worker] task ${task.id} runtime error`);
     return false;
   } finally {
     clearInterval(heartbeatTimer);

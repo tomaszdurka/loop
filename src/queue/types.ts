@@ -1,14 +1,21 @@
-export type JobStatus = 'queued' | 'leased' | 'running' | 'succeeded' | 'failed';
+export type TaskStatus = 'queued' | 'leased' | 'running' | 'done' | 'failed' | 'blocked';
 
 export type JudgeDecisionValue = 'YES' | 'NO' | null;
 
-export type JobRow = {
+export type TaskRow = {
   id: string;
+  type: string;
+  title: string;
   prompt: string;
   success_criteria: string | null;
-  status: JobStatus;
+  payload_json: string;
+  status: TaskStatus;
+  priority: number;
   attempt_count: number;
   max_attempts: number;
+  next_run_at: string | null;
+  parent_task_id: string | null;
+  dedupe_key: string | null;
   lease_owner: string | null;
   lease_expires_at: string | null;
   last_error: string | null;
@@ -16,11 +23,11 @@ export type JobRow = {
   updated_at: string;
 };
 
-export type JobAttemptRow = {
+export type TaskAttemptRow = {
   id: number;
-  job_id: string;
+  task_id: string;
   attempt_no: number;
-  status: 'running' | 'succeeded' | 'failed';
+  status: 'running' | 'done' | 'failed';
   worker_exit_code: number | null;
   judge_decision: JudgeDecisionValue;
   judge_explanation: string | null;
@@ -29,9 +36,47 @@ export type JobAttemptRow = {
   finished_at: string | null;
 };
 
-export type CreateJobInput = {
+export type EventRow = {
+  id: number;
+  task_id: string | null;
+  kind: string;
+  data_json: string;
+  created_at: string;
+};
+
+export type StateRow = {
+  key: string;
+  value_json: string;
+  updated_at: string;
+};
+
+export type ResponsibilityRow = {
+  id: string;
+  description: string;
+  enabled: 0 | 1;
+  every_ms: number;
+  task_type: string;
+  task_title: string;
+  task_prompt: string;
+  task_success_criteria: string | null;
+  dedupe_key: string | null;
+  priority: number;
+  last_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CreateTaskInput = {
+  type?: string;
+  title?: string;
   prompt: string;
   successCriteria?: string;
+  payload?: Record<string, unknown>;
+  priority?: number;
+  maxAttempts?: number;
+  nextRunAt?: string;
+  parentTaskId?: string;
+  dedupeKey?: string;
 };
 
 export type CompleteAttemptInput = {

@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { openQueueDb } from './db.js';
 import { loadQueueConfig } from './config.js';
 import { QueueRepository } from './repository.js';
-import type { CompleteAttemptInput, JobStatus, JudgeDecisionValue } from './types.js';
+import type { CompleteAttemptInput, JudgeDecisionValue, TaskStatus } from './types.js';
 
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   const serialized = JSON.stringify(body);
@@ -29,13 +29,33 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(raw);
 }
 
-function toApiJob(job: {
+function normalizeStatus(value: string | null): TaskStatus | null {
+  if (!value) {
+    return null;
+  }
+  if (value === 'succeeded') {
+    return 'done';
+  }
+  if (['queued', 'leased', 'running', 'done', 'failed', 'blocked'].includes(value)) {
+    return value as TaskStatus;
+  }
+  return null;
+}
+
+function toApiTask(task: {
   id: string;
+  type: string;
+  title: string;
   prompt: string;
   success_criteria: string | null;
-  status: JobStatus;
+  payload_json: string;
+  status: TaskStatus;
+  priority: number;
   attempt_count: number;
   max_attempts: number;
+  next_run_at: string | null;
+  parent_task_id: string | null;
+  dedupe_key: string | null;
   lease_owner: string | null;
   lease_expires_at: string | null;
   last_error: string | null;
@@ -43,22 +63,45 @@ function toApiJob(job: {
   updated_at: string;
 }): Record<string, unknown> {
   return {
-    id: job.id,
-    prompt: job.prompt,
-    success_criteria: job.success_criteria,
-    status: job.status,
-    attempt_count: job.attempt_count,
-    max_attempts: job.max_attempts,
-    lease_owner: job.lease_owner,
-    lease_expires_at: job.lease_expires_at,
-    last_error: job.last_error,
-    created_at: job.created_at,
-    updated_at: job.updated_at
+    id: task.id,
+    type: task.type,
+    title: task.title,
+    prompt: task.prompt,
+    success_criteria: task.success_criteria,
+    payload: JSON.parse(task.payload_json),
+    status: task.status,
+    attempt_count: task.attempt_count,
+    max_attempts: task.max_attempts,
+    priority: task.priority,
+    next_run_at: task.next_run_at,
+    parent_task_id: task.parent_task_id,
+    dedupe_key: task.dedupe_key,
+    lease_owner: task.lease_owner,
+    lease_expires_at: task.lease_expires_at,
+    last_error: task.last_error,
+    created_at: task.created_at,
+    updated_at: task.updated_at
   };
 }
 
 function isJudgeDecision(value: unknown): value is JudgeDecisionValue {
   return value === 'YES' || value === 'NO' || value === null;
+}
+
+function toApiJobFromTask(task: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: task.id,
+    prompt: task.prompt,
+    success_criteria: task.success_criteria,
+    status: task.status === 'done' ? 'succeeded' : task.status,
+    attempt_count: task.attempt_count,
+    max_attempts: task.max_attempts,
+    lease_owner: task.lease_owner,
+    lease_expires_at: task.lease_expires_at,
+    last_error: task.last_error,
+    created_at: task.created_at,
+    updated_at: task.updated_at
+  };
 }
 
 export function startQueueApi(): void {
@@ -76,7 +119,7 @@ export function startQueueApi(): void {
         return;
       }
 
-      if (method === 'POST' && url.pathname === '/jobs') {
+      if (method === 'POST' && (url.pathname === '/tasks' || url.pathname === '/jobs')) {
         const body = await readJsonBody(req);
         const prompt = typeof (body as { prompt?: unknown }).prompt === 'string'
           ? (body as { prompt: string }).prompt.trim()
@@ -94,20 +137,30 @@ export function startQueueApi(): void {
           return;
         }
 
-        const job = repo.enqueueJob(
-          { prompt, successCriteria },
+        const type = typeof (body as { type?: unknown }).type === 'string'
+          ? (body as { type: string }).type.trim()
+          : undefined;
+        const title = typeof (body as { title?: unknown }).title === 'string'
+          ? (body as { title: string }).title.trim()
+          : undefined;
+        const priority = Number.isInteger((body as { priority?: unknown }).priority)
+          ? Number((body as { priority: number }).priority)
+          : undefined;
+
+        const task = repo.createTask(
+          { prompt, successCriteria, type, title, priority },
           config.maxAttempts
         );
 
         sendJson(res, 201, {
-          id: job.id,
-          status: job.status,
-          created_at: job.created_at
+          id: task.id,
+          status: task.status,
+          created_at: task.created_at
         });
         return;
       }
 
-      if (method === 'POST' && url.pathname === '/jobs/lease') {
+      if (method === 'POST' && (url.pathname === '/tasks/lease' || url.pathname === '/jobs/lease')) {
         const body = await readJsonBody(req) as {
           worker_id?: unknown;
           lease_ttl_ms?: unknown;
@@ -126,58 +179,75 @@ export function startQueueApi(): void {
           return;
         }
 
-        const job = repo.claimNextJob(workerId, leaseTtlMs);
-        if (!job) {
-          sendJson(res, 200, { job: null });
+        const task = repo.claimNextTask(workerId, leaseTtlMs);
+        if (!task) {
+          sendJson(res, 200, { task: null, job: null });
           return;
         }
 
-        const startedAttempt = repo.startAttempt(job.id, workerId);
+        const startedAttempt = repo.startAttempt(task.id, workerId);
         if (startedAttempt === 0) {
-          sendJson(res, 409, { error: 'failed to start attempt for leased job' });
+          sendJson(res, 409, { error: 'failed to start attempt for leased task' });
           return;
         }
 
-        const leasedJob = repo.getJobById(job.id);
+        const leasedTask = repo.getTaskById(task.id);
+        const apiTask = leasedTask ? toApiTask(leasedTask) : toApiTask(task);
         sendJson(res, 200, {
-          job: leasedJob ? toApiJob(leasedJob) : toApiJob(job),
+          task: apiTask,
+          job: toApiJobFromTask(apiTask),
           attempt_no: startedAttempt
         });
         return;
       }
 
-      if (method === 'GET' && url.pathname === '/jobs') {
+      if (method === 'GET' && (url.pathname === '/tasks' || url.pathname === '/jobs')) {
         const statusQuery = url.searchParams.get('status');
-        if (statusQuery && !['queued', 'leased', 'running', 'succeeded', 'failed'].includes(statusQuery)) {
+        const normalizedStatus = normalizeStatus(statusQuery);
+        if (statusQuery && !normalizedStatus) {
           sendJson(res, 400, { error: 'invalid status filter' });
           return;
         }
 
-        const jobs = repo.listJobs(statusQuery as JobStatus | null ?? undefined);
-        sendJson(res, 200, { jobs: jobs.map(toApiJob) });
+        const tasks = repo.listTasks(normalizedStatus ?? undefined);
+        const apiTasks = tasks.map(toApiTask);
+        if (url.pathname === '/tasks') {
+          sendJson(res, 200, { tasks: apiTasks });
+        } else {
+          sendJson(res, 200, { jobs: apiTasks.map(toApiJobFromTask) });
+        }
         return;
       }
 
-      const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
-      if (method === 'GET' && jobMatch) {
-        const id = decodeURIComponent(jobMatch[1]);
-        const job = repo.getJobById(id);
-        if (!job) {
-          sendJson(res, 404, { error: 'job not found' });
+      const taskMatch = url.pathname.match(/^\/(tasks|jobs)\/([^/]+)$/);
+      if (method === 'GET' && taskMatch) {
+        const resource = taskMatch[1];
+        const id = decodeURIComponent(taskMatch[2]);
+        const task = repo.getTaskById(id);
+        if (!task) {
+          sendJson(res, 404, { error: 'task not found' });
           return;
         }
 
-        const attempts = repo.getAttemptsForJob(id);
-        sendJson(res, 200, {
-          ...toApiJob(job),
-          attempts
-        });
+        const attempts = repo.getAttemptsForTask(id);
+        const apiTask = toApiTask(task);
+        if (resource === 'tasks') {
+          sendJson(res, 200, {
+            ...apiTask,
+            attempts
+          });
+        } else {
+          sendJson(res, 200, {
+            ...toApiJobFromTask(apiTask),
+            attempts: attempts.map((a) => ({ ...a, task_id: undefined, job_id: a.task_id, status: a.status === 'done' ? 'succeeded' : a.status }))
+          });
+        }
         return;
       }
 
-      const heartbeatMatch = url.pathname.match(/^\/jobs\/([^/]+)\/heartbeat$/);
+      const heartbeatMatch = url.pathname.match(/^\/(tasks|jobs)\/([^/]+)\/heartbeat$/);
       if (method === 'POST' && heartbeatMatch) {
-        const id = decodeURIComponent(heartbeatMatch[1]);
+        const id = decodeURIComponent(heartbeatMatch[2]);
         const body = await readJsonBody(req) as { worker_id?: unknown; lease_ttl_ms?: unknown };
         const workerId = typeof body.worker_id === 'string' ? body.worker_id.trim() : '';
         const leaseTtlMs = Number.isInteger(body.lease_ttl_ms)
@@ -198,9 +268,9 @@ export function startQueueApi(): void {
         return;
       }
 
-      const leaseByIdMatch = url.pathname.match(/^\/jobs\/([^/]+)\/lease$/);
+      const leaseByIdMatch = url.pathname.match(/^\/(tasks|jobs)\/([^/]+)\/lease$/);
       if (method === 'POST' && leaseByIdMatch) {
-        const id = decodeURIComponent(leaseByIdMatch[1]);
+        const id = decodeURIComponent(leaseByIdMatch[2]);
         const body = await readJsonBody(req) as { worker_id?: unknown; lease_ttl_ms?: unknown };
         const workerId = typeof body.worker_id === 'string' ? body.worker_id.trim() : '';
         const leaseTtlMs = Number.isInteger(body.lease_ttl_ms)
@@ -216,29 +286,31 @@ export function startQueueApi(): void {
           return;
         }
 
-        const job = repo.leaseJobById(id, workerId, leaseTtlMs);
-        if (!job) {
-          sendJson(res, 409, { error: 'job is not available for lease' });
+        const task = repo.leaseTaskById(id, workerId, leaseTtlMs);
+        if (!task) {
+          sendJson(res, 409, { error: 'task is not available for lease' });
           return;
         }
 
-        const startedAttempt = repo.startAttempt(job.id, workerId);
+        const startedAttempt = repo.startAttempt(task.id, workerId);
         if (startedAttempt === 0) {
-          sendJson(res, 409, { error: 'failed to start attempt for leased job' });
+          sendJson(res, 409, { error: 'failed to start attempt for leased task' });
           return;
         }
 
-        const leasedJob = repo.getJobById(job.id);
+        const leasedTask = repo.getTaskById(task.id);
+        const apiTask = leasedTask ? toApiTask(leasedTask) : toApiTask(task);
         sendJson(res, 200, {
-          job: leasedJob ? toApiJob(leasedJob) : toApiJob(job),
+          task: apiTask,
+          job: toApiJobFromTask(apiTask),
           attempt_no: startedAttempt
         });
         return;
       }
 
-      const completeMatch = url.pathname.match(/^\/jobs\/([^/]+)\/complete$/);
+      const completeMatch = url.pathname.match(/^\/(tasks|jobs)\/([^/]+)\/complete$/);
       if (method === 'POST' && completeMatch) {
-        const id = decodeURIComponent(completeMatch[1]);
+        const id = decodeURIComponent(completeMatch[2]);
         const body = await readJsonBody(req) as {
           worker_id?: unknown;
           worker_exit_code?: unknown;
@@ -281,8 +353,26 @@ export function startQueueApi(): void {
         };
 
         repo.completeAttempt(id, workerId, completeInput);
-        const job = repo.getJobById(id);
-        sendJson(res, 200, { ok: true, status: job?.status ?? null });
+        const task = repo.getTaskById(id);
+        sendJson(res, 200, { ok: true, status: task?.status ?? null });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/events') {
+        const limitRaw = url.searchParams.get('limit');
+        const limit = limitRaw ? Number(limitRaw) : 50;
+        sendJson(res, 200, { events: repo.listEvents(Number.isFinite(limit) ? limit : 50) });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/responsibilities') {
+        sendJson(res, 200, { responsibilities: repo.listResponsibilities() });
+        return;
+      }
+
+      if (method === 'POST' && url.pathname === '/tick') {
+        const result = repo.runDueResponsibilities(config.maxAttempts);
+        sendJson(res, 200, result);
         return;
       }
 

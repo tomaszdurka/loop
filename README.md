@@ -1,13 +1,12 @@
 # loop
 
-`loop` is a small orchestration tool with two layers:
+`loop` is a local orchestration tool with a durable task lifecycle.
 
-1. `loop run`:
-   - runs an agent prompt repeatedly (optionally with a success criteria judge)
-   - stops on success or max iterations
-2. queue system:
-   - `loop gateway` exposes API for queuing/listing/leasing jobs
-   - `loop worker` pulls queued jobs and executes them via `loop run-job` -> `loop run`
+It now runs on a unified model:
+1. one canonical `tasks` queue (lease/retry/status)
+2. internal `events` timeline
+3. internal `state` checkpoints
+4. recurring `responsibilities` that dispatch tasks on each tick
 
 ## Install
 
@@ -18,9 +17,16 @@ npm install
 ## Commands
 
 - `loop gateway`
-- `loop run "<prompt>" [--success "..."] [--provider codex|claude] [--max-iterations N] [--cwd "/path"]`
-- `loop run-job <job-id> [--stream-job-logs]`
 - `loop worker [--stream-job-logs]`
+- `loop run "<prompt>" [--success "..."] [--provider codex|claude] [--max-iterations N] [--cwd "/path"]`
+- `loop run-job <task-id> [--stream-job-logs]`
+- `loop db:migrate`
+- `loop tick`
+- `loop status`
+- `loop tasks:list [--status queued|leased|running|done|failed|blocked]`
+- `loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]`
+- `loop events:tail [--limit N]`
+- `loop responsibilities:list`
 
 Equivalent via npm:
 
@@ -30,44 +36,57 @@ npm run loop -- <command...>
 
 ## Quick Flow
 
-1. Start gateway (terminal A):
+1. Initialize schema:
+
+```bash
+npm run loop -- db:migrate
+```
+
+2. Start gateway (terminal A):
 
 ```bash
 npm run loop -- gateway
 ```
 
-2. Start worker (terminal B):
+3. Start worker (terminal B):
 
 ```bash
 npm run loop -- worker --stream-job-logs
 ```
 
-3. Queue a job (terminal C):
+4. Run a heartbeat tick to dispatch due responsibilities:
 
 ```bash
-curl -sS -X POST http://localhost:7070/jobs \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Implement feature X",
-    "success_criteria": "File src/x.ts exists and tests pass"
-  }'
+npm run loop -- tick
 ```
 
-4. Check job status:
+5. Or create a task directly:
 
 ```bash
-curl -sS http://localhost:7070/jobs/<job_id>
+npm run loop -- tasks:create --prompt "Check outstanding tasks and progress one" --type maintenance --title "Progress outstanding tasks"
+```
+
+6. Check status:
+
+```bash
+npm run loop -- status
 ```
 
 ## REST API
 
-- `POST /jobs` (`prompt` required, `success_criteria` optional)
-- `GET /jobs/:id`
-- `GET /jobs?status=queued|leased|running|succeeded|failed`
-- `POST /jobs/lease`
-- `POST /jobs/:id/lease`
-- `POST /jobs/:id/heartbeat`
-- `POST /jobs/:id/complete`
+Canonical task API:
+- `POST /tasks`
+- `GET /tasks/:id`
+- `GET /tasks?status=queued|leased|running|done|failed|blocked`
+- `POST /tasks/lease`
+- `POST /tasks/:id/lease`
+- `POST /tasks/:id/heartbeat`
+- `POST /tasks/:id/complete`
+- `GET /events?limit=N`
+- `GET /responsibilities`
+- `POST /tick`
+
+Backward compatibility aliases exist for `/jobs*` routes.
 
 ## Env Vars
 
