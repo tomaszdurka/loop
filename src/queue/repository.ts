@@ -1,14 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type {
+  ArtifactRow,
   CompleteAttemptInput,
+  CreateArtifactInput,
   CreateTaskInput,
   EventRow,
   ResponsibilityRow,
   StateRow,
+  TaskStepRow,
   TaskAttemptRow,
   TaskRow,
-  TaskStatus
+  TaskStatus,
+  UpsertTaskStepInput
 } from './types.js';
 
 function nowIso(): string {
@@ -318,11 +322,36 @@ export class QueueRepository {
         )
         .run(nextStatus, newAttemptCount, result.errorMessage, result.finishedAt, taskId);
 
+      this.createArtifact({
+        taskId,
+        kind: 'text',
+        bodyOrUri: result.output,
+        meta: {
+          worker_id: workerId,
+          attempt_no: attemptNo,
+          worker_exit_code: result.workerExitCode,
+          judge_decision: result.judgeDecision,
+          judge_explanation: result.judgeExplanation,
+          succeeded: result.succeeded
+        }
+      });
+
+      const parsedSteps = this.extractStepsFromOutput(result.output);
+      for (const step of parsedSteps) {
+        this.upsertTaskStep(taskId, {
+          stepKey: step.stepKey,
+          status: step.status,
+          idempotencyKey: step.idempotencyKey,
+          result: { note: step.note ?? null, source: 'output_marker' }
+        });
+      }
+
       this.appendEvent(result.succeeded ? 'task_completed' : 'task_failed', {
         worker_id: workerId,
         attempt_no: attemptNo,
         error_message: result.errorMessage,
-        next_status: nextStatus
+        next_status: nextStatus,
+        parsed_steps: parsedSteps.length
       }, taskId);
     });
 
@@ -440,5 +469,103 @@ export class QueueRepository {
     });
 
     return tx();
+  }
+
+  upsertTaskStep(taskId: string, input: UpsertTaskStepInput): TaskStepRow {
+    const now = nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO task_steps (
+          task_id, step_key, status, idempotency_key, result_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, step_key) DO UPDATE SET
+          status=excluded.status,
+          idempotency_key=excluded.idempotency_key,
+          result_json=excluded.result_json,
+          updated_at=excluded.updated_at`
+      )
+      .run(
+        taskId,
+        input.stepKey,
+        input.status,
+        input.idempotencyKey ?? null,
+        JSON.stringify(input.result ?? {}),
+        now
+      );
+
+    return this.db
+      .prepare('SELECT * FROM task_steps WHERE task_id = ? AND step_key = ?')
+      .get(taskId, input.stepKey) as TaskStepRow;
+  }
+
+  listTaskSteps(taskId: string): TaskStepRow[] {
+    return this.db
+      .prepare('SELECT * FROM task_steps WHERE task_id = ? ORDER BY id ASC')
+      .all(taskId) as TaskStepRow[];
+  }
+
+  createArtifact(input: CreateArtifactInput): ArtifactRow {
+    const now = nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO artifacts (task_id, kind, body_or_uri, meta_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.taskId ?? null,
+        input.kind,
+        input.bodyOrUri,
+        JSON.stringify(input.meta ?? {}),
+        now
+      );
+
+    const row = this.db
+      .prepare('SELECT * FROM artifacts WHERE rowid = last_insert_rowid()')
+      .get() as ArtifactRow | undefined;
+    if (!row) {
+      throw new Error('Failed to create artifact row');
+    }
+    return row;
+  }
+
+  listArtifacts(limit = 50, taskId?: string): ArtifactRow[] {
+    const safeLimit = Math.max(1, Math.min(500, limit));
+    if (taskId) {
+      return this.db
+        .prepare('SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at DESC LIMIT ?')
+        .all(taskId, safeLimit) as ArtifactRow[];
+    }
+
+    return this.db
+      .prepare('SELECT * FROM artifacts ORDER BY created_at DESC LIMIT ?')
+      .all(safeLimit) as ArtifactRow[];
+  }
+
+  private extractStepsFromOutput(output: string): Array<{
+    stepKey: string;
+    status: 'done' | 'failed';
+    idempotencyKey?: string | null;
+    note?: string | null;
+  }> {
+    const steps: Array<{
+      stepKey: string;
+      status: 'done' | 'failed';
+      idempotencyKey?: string | null;
+      note?: string | null;
+    }> = [];
+
+    // Marker format: STEP[<key>]: DONE|FAILED [idempotency=<token>] [note=<text>]
+    const regex = /^STEP\[(.+?)\]:\s*(DONE|FAILED)(?:\s+idempotency=([^\s]+))?(?:\s+note=(.+))?$/gim;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(output)) !== null) {
+      steps.push({
+        stepKey: match[1].trim(),
+        status: match[2].toUpperCase() === 'DONE' ? 'done' : 'failed',
+        idempotencyKey: match[3]?.trim() ?? null,
+        note: match[4]?.trim() ?? null
+      });
+    }
+
+    return steps;
   }
 }

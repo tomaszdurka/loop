@@ -44,6 +44,27 @@ export type EventRow = {
   created_at: string;
 };
 
+export type TaskStepStatus = 'pending' | 'running' | 'done' | 'failed';
+
+export type TaskStepRow = {
+  id: number;
+  task_id: string;
+  step_key: string;
+  status: TaskStepStatus;
+  idempotency_key: string | null;
+  result_json: string;
+  updated_at: string;
+};
+
+export type ArtifactRow = {
+  id: number;
+  task_id: string | null;
+  kind: 'text' | 'json' | 'file_ref';
+  body_or_uri: string;
+  meta_json: string;
+  created_at: string;
+};
+
 export type StateRow = {
   key: string;
   value_json: string;
@@ -87,4 +108,18 @@ export type CompleteAttemptInput = {
   succeeded: boolean;
   errorMessage: string | null;
   finishedAt: string;
+};
+
+export type UpsertTaskStepInput = {
+  stepKey: string;
+  status: TaskStepStatus;
+  idempotencyKey?: string | null;
+  result?: Record<string, unknown>;
+};
+
+export type CreateArtifactInput = {
+  taskId?: string | null;
+  kind: 'text' | 'json' | 'file_ref';
+  bodyOrUri: string;
+  meta?: Record<string, unknown>;
 };

@@ -27,6 +27,8 @@ npm install
 - `loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]`
 - `loop events:tail [--limit N]`
 - `loop responsibilities:list`
+- `loop steps:list <task-id>`
+- `loop artifacts:list [--task-id ID] [--limit N]`
 
 Equivalent via npm:
 
@@ -77,16 +79,27 @@ npm run loop -- status
 Canonical task API:
 - `POST /tasks`
 - `GET /tasks/:id`
+- `GET /tasks/:id/steps`
 - `GET /tasks?status=queued|leased|running|done|failed|blocked`
 - `POST /tasks/lease`
 - `POST /tasks/:id/lease`
 - `POST /tasks/:id/heartbeat`
 - `POST /tasks/:id/complete`
 - `GET /events?limit=N`
+- `GET /artifacts?task_id=<id>&limit=N`
 - `GET /responsibilities`
 - `POST /tick`
 
 Backward compatibility aliases exist for `/jobs*` routes.
+
+## Optional step markers for checkpointing
+
+If your task output includes markers in this format, they are stored in `task_steps`:
+
+```text
+STEP[fetch_emails]: DONE idempotency=inbox-sync-2026-02-27 note=Fetched 12 emails
+STEP[reply_draft]: FAILED idempotency=reply-abc123 note=Model refused
+```
 
 ## Env Vars
 

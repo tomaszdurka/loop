@@ -68,6 +68,34 @@ export function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_events_task_id_created_at ON events(task_id, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS task_steps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT NOT NULL,
+      step_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      idempotency_key TEXT,
+      result_json TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+      UNIQUE(task_id, step_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_task_steps_task_id ON task_steps(task_id);
+    CREATE INDEX IF NOT EXISTS idx_task_steps_status ON task_steps(status);
+
+    CREATE TABLE IF NOT EXISTS artifacts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT,
+      kind TEXT NOT NULL,
+      body_or_uri TEXT NOT NULL,
+      meta_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_artifacts_task_id_created_at ON artifacts(task_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at DESC);
+
     CREATE TABLE IF NOT EXISTS state (
       key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL,

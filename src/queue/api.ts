@@ -230,11 +230,15 @@ export function startQueueApi(): void {
         }
 
         const attempts = repo.getAttemptsForTask(id);
+        const steps = repo.listTaskSteps(id);
+        const artifacts = repo.listArtifacts(20, id);
         const apiTask = toApiTask(task);
         if (resource === 'tasks') {
           sendJson(res, 200, {
             ...apiTask,
-            attempts
+            attempts,
+            steps,
+            artifacts
           });
         } else {
           sendJson(res, 200, {
@@ -362,6 +366,21 @@ export function startQueueApi(): void {
         const limitRaw = url.searchParams.get('limit');
         const limit = limitRaw ? Number(limitRaw) : 50;
         sendJson(res, 200, { events: repo.listEvents(Number.isFinite(limit) ? limit : 50) });
+        return;
+      }
+
+      const taskStepsMatch = url.pathname.match(/^\/tasks\/([^/]+)\/steps$/);
+      if (method === 'GET' && taskStepsMatch) {
+        const id = decodeURIComponent(taskStepsMatch[1]);
+        sendJson(res, 200, { steps: repo.listTaskSteps(id) });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/artifacts') {
+        const limitRaw = url.searchParams.get('limit');
+        const limit = limitRaw ? Number(limitRaw) : 50;
+        const taskId = url.searchParams.get('task_id') ?? undefined;
+        sendJson(res, 200, { artifacts: repo.listArtifacts(Number.isFinite(limit) ? limit : 50, taskId) });
         return;
       }
 

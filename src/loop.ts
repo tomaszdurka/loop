@@ -29,7 +29,9 @@ function usage(): string {
     '  loop tasks:list [--status queued|leased|running|done|failed|blocked]',
     '  loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]',
     '  loop events:tail [--limit N]',
-    '  loop responsibilities:list'
+    '  loop responsibilities:list',
+    '  loop steps:list <task-id>',
+    '  loop artifacts:list [--task-id ID] [--limit N]'
   ].join('\n');
 }
 
@@ -186,6 +188,30 @@ async function main(): Promise<void> {
 
     const events = withRepo((repo) => repo.listEvents(limit));
     printJson({ events });
+    return;
+  }
+
+  if (command === 'steps:list') {
+    const parsed = parseCliArgs(args.slice(1));
+    const taskId = parsed.positional[0];
+    if (!taskId) {
+      throw new Error('steps:list requires <task-id>');
+    }
+    const steps = withRepo((repo) => repo.listTaskSteps(taskId));
+    printJson({ steps });
+    return;
+  }
+
+  if (command === 'artifacts:list') {
+    const parsed = parseCliArgs(args.slice(1));
+    const taskId = parsed.named.get('--task-id') ?? undefined;
+    const limitRaw = parsed.named.get('--limit') ?? '50';
+    const limit = Number(limitRaw);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new Error('--limit must be an integer between 1 and 500');
+    }
+    const artifacts = withRepo((repo) => repo.listArtifacts(limit, taskId));
+    printJson({ artifacts });
     return;
   }
 
