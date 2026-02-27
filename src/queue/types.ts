@@ -76,6 +76,12 @@ export type ResponsibilityRow = {
   description: string;
   enabled: 0 | 1;
   every_ms: number;
+  source_kind: string;
+  cursor_key: string | null;
+  dedupe_template: string | null;
+  user_prompt: string | null;
+  compile_version: number;
+  contract_json: string;
   task_type: string;
   task_title: string;
   task_prompt: string;

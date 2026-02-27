@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TaskRow } from '../queue/types.js';
@@ -22,6 +22,7 @@ type LeaseResponse = {
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const RUNS_ROOT = resolve(PROJECT_ROOT, 'runs');
 const LOOP_ENTRYPOINT = resolve(PROJECT_ROOT, 'src', 'loop.ts');
+const SYSTEM_PROMPTS_DIR = resolve(PROJECT_ROOT, 'prompts', 'system');
 
 function runCommand(
   command: string,
@@ -150,11 +151,12 @@ async function runJobViaExistingLoop(
   runId: string,
   streamJobLogs: boolean
 ): Promise<CommandResult> {
+  const effectivePrompt = buildEffectiveTaskPrompt(task);
   const args = [
     'tsx',
     LOOP_ENTRYPOINT,
     'run',
-    task.prompt,
+    effectivePrompt,
     '--cwd',
     runDir,
     '--max-iterations',
@@ -172,6 +174,42 @@ async function runJobViaExistingLoop(
     : undefined;
 
   return runCommand('npx', args, runDir, onOutputLine);
+}
+
+function readSystemPromptFile(name: string): string {
+  const filePath = resolve(SYSTEM_PROMPTS_DIR, name);
+  if (!existsSync(filePath)) {
+    return '';
+  }
+
+  return readFileSync(filePath, 'utf8').trim();
+}
+
+function buildEffectiveTaskPrompt(task: TaskRow): string {
+  const executor = readSystemPromptFile('executor.md');
+  const capabilities = readSystemPromptFile('capabilities.md');
+  const responsibilityDispatcher = readSystemPromptFile('responsibility-dispatcher.md');
+  const isResponsibilityTask = isTaskFromResponsibility(task);
+
+  const parts = [
+    executor ? `## System Executor\n${executor}` : '',
+    capabilities ? `## System Capabilities\n${capabilities}` : '',
+    isResponsibilityTask && responsibilityDispatcher
+      ? `## System Responsibility Dispatcher\n${responsibilityDispatcher}`
+      : '',
+    `## Task\n${task.prompt.trim()}`
+  ].filter((p) => p.length > 0);
+
+  return `${parts.join('\n\n')}\n`;
+}
+
+function isTaskFromResponsibility(task: TaskRow): boolean {
+  try {
+    const payload = JSON.parse(task.payload_json) as { responsibility_id?: unknown };
+    return typeof payload.responsibility_id === 'string' && payload.responsibility_id.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 export async function runLeasedJob(

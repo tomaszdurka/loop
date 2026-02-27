@@ -202,16 +202,50 @@ export function initSchema(db: Database.Database): void {
   }
 
   // Seed starter responsibility for first-time users.
+  if (!hasColumn(db, 'responsibilities', 'source_kind')) {
+    db.exec(`ALTER TABLE responsibilities ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'generic'`);
+  }
+  if (!hasColumn(db, 'responsibilities', 'cursor_key')) {
+    db.exec(`ALTER TABLE responsibilities ADD COLUMN cursor_key TEXT`);
+  }
+  if (!hasColumn(db, 'responsibilities', 'dedupe_template')) {
+    db.exec(`ALTER TABLE responsibilities ADD COLUMN dedupe_template TEXT`);
+  }
+  if (!hasColumn(db, 'responsibilities', 'user_prompt')) {
+    db.exec(`ALTER TABLE responsibilities ADD COLUMN user_prompt TEXT`);
+  }
+  if (!hasColumn(db, 'responsibilities', 'compile_version')) {
+    db.exec(`ALTER TABLE responsibilities ADD COLUMN compile_version INTEGER NOT NULL DEFAULT 1`);
+  }
+  if (!hasColumn(db, 'responsibilities', 'contract_json')) {
+    db.exec(`ALTER TABLE responsibilities ADD COLUMN contract_json TEXT NOT NULL DEFAULT '{}'`);
+  }
+
+  db.exec(`
+    UPDATE responsibilities
+    SET source_kind = COALESCE(source_kind, 'generic'),
+        compile_version = COALESCE(compile_version, 1),
+        contract_json = COALESCE(contract_json, '{}')
+    WHERE source_kind IS NULL OR compile_version IS NULL OR contract_json IS NULL;
+  `);
+
   const now = new Date().toISOString();
   db.prepare(
     `INSERT OR IGNORE INTO responsibilities (
-      id, description, enabled, every_ms, task_type, task_title, task_prompt,
+      id, description, enabled, every_ms, source_kind, cursor_key, dedupe_template,
+      user_prompt, compile_version, contract_json, task_type, task_title, task_prompt,
       task_success_criteria, dedupe_key, priority, last_run_at, created_at, updated_at
-    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
   ).run(
     'check_outstanding_tasks',
     'Periodically ask the agent to inspect open work and propose next actions.',
     60_000,
+    'generic',
+    null,
+    'generic:{source_item_id}:general',
+    'Check outstanding tasks proactively.',
+    1,
+    JSON.stringify({ compile_version: 1, source_kind: 'generic' }),
     'maintenance',
     'Review and progress outstanding tasks',
     'Check for outstanding tasks and progress the highest-priority actionable one. If nothing actionable exists, report idle.',

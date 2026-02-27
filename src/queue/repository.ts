@@ -14,6 +14,7 @@ import type {
   TaskStatus,
   UpsertTaskStepInput
 } from './types.js';
+import type { CompiledResponsibility } from '../responsibility/compiler.js';
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -445,6 +446,75 @@ export class QueueRepository {
     return this.db
       .prepare('SELECT * FROM responsibilities ORDER BY id ASC')
       .all() as ResponsibilityRow[];
+  }
+
+  upsertCompiledResponsibility(input: {
+    id: string;
+    enabled?: boolean;
+    priority?: number;
+    compiled: CompiledResponsibility;
+  }): ResponsibilityRow {
+    const now = nowIso();
+    const enabled = input.enabled ?? true;
+    const priority = Number.isInteger(input.priority) ? Math.max(1, Math.min(5, input.priority!)) : 3;
+
+    this.db
+      .prepare(
+        `INSERT INTO responsibilities (
+          id, description, enabled, every_ms, source_kind, cursor_key, dedupe_template,
+          user_prompt, compile_version, contract_json, task_type, task_title, task_prompt,
+          task_success_criteria, dedupe_key, priority, last_run_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          description=excluded.description,
+          enabled=excluded.enabled,
+          every_ms=excluded.every_ms,
+          source_kind=excluded.source_kind,
+          cursor_key=excluded.cursor_key,
+          dedupe_template=excluded.dedupe_template,
+          user_prompt=excluded.user_prompt,
+          compile_version=excluded.compile_version,
+          contract_json=excluded.contract_json,
+          task_type=excluded.task_type,
+          task_title=excluded.task_title,
+          task_prompt=excluded.task_prompt,
+          dedupe_key=excluded.dedupe_key,
+          priority=excluded.priority,
+          updated_at=excluded.updated_at`
+      )
+      .run(
+        input.id,
+        input.compiled.description,
+        enabled ? 1 : 0,
+        input.compiled.everyMs,
+        input.compiled.sourceKind,
+        input.compiled.cursorKey,
+        input.compiled.dedupeTemplate,
+        (input.compiled.contract.user_prompt as string) ?? null,
+        1,
+        JSON.stringify(input.compiled.contract),
+        input.compiled.taskType,
+        input.compiled.taskTitle,
+        input.compiled.taskPrompt,
+        `responsibility:${input.id}:scan`,
+        priority,
+        now,
+        now
+      );
+
+    const row = this.db
+      .prepare('SELECT * FROM responsibilities WHERE id = ?')
+      .get(input.id) as ResponsibilityRow | undefined;
+    if (!row) {
+      throw new Error('Failed to upsert responsibility');
+    }
+
+    this.appendEvent('responsibility_compiled', {
+      responsibility_id: input.id,
+      source_kind: input.compiled.sourceKind,
+      cadence_ms: input.compiled.everyMs
+    });
+    return row;
   }
 
   listChildTasks(parentTaskId: string): TaskRow[] {

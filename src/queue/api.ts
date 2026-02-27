@@ -3,6 +3,7 @@ import { openQueueDb } from './db.js';
 import { loadQueueConfig } from './config.js';
 import { QueueRepository } from './repository.js';
 import type { CompleteAttemptInput, JudgeDecisionValue, TaskStatus } from './types.js';
+import { compileResponsibilityPrompt } from '../responsibility/compiler.js';
 
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   const serialized = JSON.stringify(body);
@@ -438,6 +439,42 @@ export function startQueueApi(): void {
 
       if (method === 'GET' && url.pathname === '/responsibilities') {
         sendJson(res, 200, { responsibilities: repo.listResponsibilities() });
+        return;
+      }
+
+      if (method === 'POST' && url.pathname === '/responsibilities') {
+        const body = await readJsonBody(req) as {
+          id?: unknown;
+          prompt?: unknown;
+          enabled?: unknown;
+          priority?: unknown;
+        };
+
+        const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+        if (!prompt) {
+          sendJson(res, 400, { error: 'prompt is required' });
+          return;
+        }
+
+        const id = typeof body.id === 'string' && body.id.trim().length > 0
+          ? body.id.trim()
+          : `resp-${Date.now()}`;
+
+        const enabled = body.enabled === undefined ? true : body.enabled === true;
+        const priority = Number.isInteger(body.priority) ? Number(body.priority) : 3;
+
+        const compiled = await compileResponsibilityPrompt(id, prompt);
+        const responsibility = repo.upsertCompiledResponsibility({
+          id,
+          enabled,
+          priority,
+          compiled
+        });
+
+        sendJson(res, 201, {
+          responsibility,
+          compiled_contract: compiled.contract
+        });
         return;
       }
 
