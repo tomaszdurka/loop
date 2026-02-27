@@ -70,6 +70,55 @@ export class QueueRepository {
     return this.getTaskById(id)!;
   }
 
+  createChildTask(
+    parentTaskId: string,
+    input: CreateTaskInput,
+    defaultMaxAttempts: number,
+    policy: { maxChildDepth: number; maxChildrenPerTask: number }
+  ): TaskRow {
+    const tx = this.db.transaction(() => {
+      const parent = this.getTaskById(parentTaskId);
+      if (!parent) {
+        throw new Error(`parent task not found: ${parentTaskId}`);
+      }
+
+      const depth = this.countTaskDepth(parentTaskId);
+      if (depth >= policy.maxChildDepth) {
+        throw new Error(`child depth limit reached (max=${policy.maxChildDepth})`);
+      }
+
+      const childCount = (this.db
+        .prepare('SELECT COUNT(*) as count FROM tasks WHERE parent_task_id = ?')
+        .get(parentTaskId) as { count: number }).count;
+      if (childCount >= policy.maxChildrenPerTask) {
+        throw new Error(`max children per task reached (max=${policy.maxChildrenPerTask})`);
+      }
+
+      const child = this.createTask(
+        {
+          ...input,
+          parentTaskId
+        },
+        defaultMaxAttempts
+      );
+
+      const now = nowIso();
+      this.db
+        .prepare(
+          `UPDATE tasks
+           SET status = 'waiting_children', updated_at = ?
+           WHERE id = ? AND status IN ('queued', 'leased', 'running')`
+        )
+        .run(now, parentTaskId);
+
+      this.appendEvent('child_task_created', { child_task_id: child.id }, parentTaskId);
+      this.appendEvent('child_task_linked', { parent_task_id: parentTaskId }, child.id);
+      return child;
+    });
+
+    return tx();
+  }
+
   getTaskById(id: string): TaskRow | null {
     const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as TaskRow | undefined;
     return row ?? null;
@@ -353,6 +402,10 @@ export class QueueRepository {
         next_status: nextStatus,
         parsed_steps: parsedSteps.length
       }, taskId);
+
+      if (task.parent_task_id) {
+        this.reconcileParentAfterChildCompletion(task.parent_task_id);
+      }
     });
 
     tx();
@@ -394,6 +447,12 @@ export class QueueRepository {
       .all() as ResponsibilityRow[];
   }
 
+  listChildTasks(parentTaskId: string): TaskRow[] {
+    return this.db
+      .prepare('SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY created_at ASC')
+      .all(parentTaskId) as TaskRow[];
+  }
+
   runDueResponsibilities(defaultMaxAttempts: number): { considered: number; created: number } {
     const tx = this.db.transaction(() => {
       const now = new Date();
@@ -417,7 +476,7 @@ export class QueueRepository {
             .prepare(
               `SELECT id FROM tasks
                WHERE dedupe_key = ?
-                 AND status IN ('queued', 'leased', 'running', 'blocked')
+                 AND status IN ('queued', 'leased', 'running', 'waiting_children', 'blocked')
                LIMIT 1`
             )
             .get(dedupeKey) as { id: string } | undefined;
@@ -567,5 +626,49 @@ export class QueueRepository {
     }
 
     return steps;
+  }
+
+  private countTaskDepth(taskId: string): number {
+    let depth = 0;
+    let currentId: string | null = taskId;
+    while (currentId) {
+      const row = this.db
+        .prepare('SELECT parent_task_id FROM tasks WHERE id = ?')
+        .get(currentId) as { parent_task_id: string | null } | undefined;
+      if (!row || !row.parent_task_id) {
+        break;
+      }
+      depth += 1;
+      currentId = row.parent_task_id;
+    }
+    return depth;
+  }
+
+  private reconcileParentAfterChildCompletion(parentTaskId: string): void {
+    const children = this.listChildTasks(parentTaskId);
+    if (children.length === 0) {
+      return;
+    }
+
+    const hasActive = children.some((c) => c.status === 'queued' || c.status === 'leased' || c.status === 'running' || c.status === 'waiting_children');
+    if (hasActive) {
+      return;
+    }
+
+    const hasFailure = children.some((c) => c.status === 'failed' || c.status === 'blocked');
+    const now = nowIso();
+    const nextStatus: TaskStatus = hasFailure ? 'blocked' : 'queued';
+    this.db
+      .prepare(
+        `UPDATE tasks
+         SET status = ?, updated_at = ?
+         WHERE id = ? AND status = 'waiting_children'`
+      )
+      .run(nextStatus, now, parentTaskId);
+
+    this.appendEvent('parent_task_resolved_children', {
+      next_status: nextStatus,
+      child_count: children.length
+    }, parentTaskId);
   }
 }

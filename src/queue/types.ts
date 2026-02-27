@@ -1,4 +1,4 @@
-export type TaskStatus = 'queued' | 'leased' | 'running' | 'done' | 'failed' | 'blocked';
+export type TaskStatus = 'queued' | 'leased' | 'running' | 'waiting_children' | 'done' | 'failed' | 'blocked';
 
 export type JudgeDecisionValue = 'YES' | 'NO' | null;
 

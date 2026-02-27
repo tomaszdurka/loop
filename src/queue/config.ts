@@ -3,6 +3,8 @@ export type QueueConfig = {
   defaultLeaseTtlMs: number;
   maxAttempts: number;
   apiPort: number;
+  maxChildDepth: number;
+  maxChildrenPerTask: number;
 };
 
 function intFromEnv(name: string, fallback: number): number {
@@ -22,6 +24,8 @@ export function loadQueueConfig(): QueueConfig {
     dbPath: process.env.QUEUE_DB_PATH ?? './data/queue.sqlite',
     defaultLeaseTtlMs: intFromEnv('QUEUE_LEASE_TTL_MS', 120000),
     maxAttempts: intFromEnv('QUEUE_MAX_ATTEMPTS', 3),
-    apiPort: intFromEnv('QUEUE_API_PORT', 7070)
+    apiPort: intFromEnv('QUEUE_API_PORT', 7070),
+    maxChildDepth: intFromEnv('QUEUE_MAX_CHILD_DEPTH', 1),
+    maxChildrenPerTask: intFromEnv('QUEUE_MAX_CHILDREN_PER_TASK', 5)
   };
 }

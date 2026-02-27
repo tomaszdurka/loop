@@ -36,7 +36,7 @@ function normalizeStatus(value: string | null): TaskStatus | null {
   if (value === 'succeeded') {
     return 'done';
   }
-  if (['queued', 'leased', 'running', 'done', 'failed', 'blocked'].includes(value)) {
+  if (['queued', 'leased', 'running', 'waiting_children', 'done', 'failed', 'blocked'].includes(value)) {
     return value as TaskStatus;
   }
   return null;
@@ -157,6 +157,51 @@ export function startQueueApi(): void {
           status: task.status,
           created_at: task.created_at
         });
+        return;
+      }
+
+      const childTaskCreateMatch = url.pathname.match(/^\/tasks\/([^/]+)\/children$/);
+      if (method === 'POST' && childTaskCreateMatch) {
+        const parentTaskId = decodeURIComponent(childTaskCreateMatch[1]);
+        const body = await readJsonBody(req);
+        const prompt = typeof (body as { prompt?: unknown }).prompt === 'string'
+          ? (body as { prompt: string }).prompt.trim()
+          : '';
+        const successCriteriaRaw = (body as { success_criteria?: unknown }).success_criteria;
+        const successCriteria = typeof successCriteriaRaw === 'string' ? successCriteriaRaw.trim() : undefined;
+
+        if (!prompt) {
+          sendJson(res, 400, { error: 'prompt is required' });
+          return;
+        }
+
+        const type = typeof (body as { type?: unknown }).type === 'string'
+          ? (body as { type: string }).type.trim()
+          : undefined;
+        const title = typeof (body as { title?: unknown }).title === 'string'
+          ? (body as { title: string }).title.trim()
+          : undefined;
+        const priority = Number.isInteger((body as { priority?: unknown }).priority)
+          ? Number((body as { priority: number }).priority)
+          : undefined;
+
+        try {
+          const task = repo.createChildTask(
+            parentTaskId,
+            { prompt, successCriteria, type, title, priority },
+            config.maxAttempts,
+            { maxChildDepth: config.maxChildDepth, maxChildrenPerTask: config.maxChildrenPerTask }
+          );
+
+          sendJson(res, 201, {
+            id: task.id,
+            parent_task_id: parentTaskId,
+            status: task.status,
+            created_at: task.created_at
+          });
+        } catch (error) {
+          sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
         return;
       }
 
@@ -373,6 +418,13 @@ export function startQueueApi(): void {
       if (method === 'GET' && taskStepsMatch) {
         const id = decodeURIComponent(taskStepsMatch[1]);
         sendJson(res, 200, { steps: repo.listTaskSteps(id) });
+        return;
+      }
+
+      const taskChildrenMatch = url.pathname.match(/^\/tasks\/([^/]+)\/children$/);
+      if (method === 'GET' && taskChildrenMatch) {
+        const id = decodeURIComponent(taskChildrenMatch[1]);
+        sendJson(res, 200, { tasks: repo.listChildTasks(id).map(toApiTask) });
         return;
       }
 

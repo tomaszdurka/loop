@@ -23,8 +23,9 @@ npm install
 - `loop db:migrate`
 - `loop tick`
 - `loop status`
-- `loop tasks:list [--status queued|leased|running|done|failed|blocked]`
+- `loop tasks:list [--status queued|leased|running|waiting_children|done|failed|blocked]`
 - `loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]`
+- `loop tasks:create-child <parent-task-id> --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]`
 - `loop events:tail [--limit N]`
 - `loop responsibilities:list`
 - `loop steps:list <task-id>`
@@ -78,9 +79,11 @@ npm run loop -- status
 
 Canonical task API:
 - `POST /tasks`
+- `POST /tasks/:id/children`
+- `GET /tasks/:id/children`
 - `GET /tasks/:id`
 - `GET /tasks/:id/steps`
-- `GET /tasks?status=queued|leased|running|done|failed|blocked`
+- `GET /tasks?status=queued|leased|running|waiting_children|done|failed|blocked`
 - `POST /tasks/lease`
 - `POST /tasks/:id/lease`
 - `POST /tasks/:id/heartbeat`
@@ -101,6 +104,15 @@ STEP[fetch_emails]: DONE idempotency=inbox-sync-2026-02-27 note=Fetched 12 email
 STEP[reply_draft]: FAILED idempotency=reply-abc123 note=Model refused
 ```
 
+## Parent-child tasks (V2)
+
+- Create a parent task with `tasks:create`.
+- Create durable child tasks with `tasks:create-child <parent-task-id> ...` or `POST /tasks/:id/children`.
+- Parent transitions to `waiting_children` while children are active.
+- When all children finish:
+  - parent goes to `queued` if all children succeeded
+  - parent goes to `blocked` if any child failed/blocked
+
 ## Env Vars
 
 Gateway:
@@ -108,6 +120,8 @@ Gateway:
 - `QUEUE_LEASE_TTL_MS` (default `120000`)
 - `QUEUE_MAX_ATTEMPTS` (default `3`)
 - `QUEUE_API_PORT` (default `7070`)
+- `QUEUE_MAX_CHILD_DEPTH` (default `1`)
+- `QUEUE_MAX_CHILDREN_PER_TASK` (default `5`)
 
 Worker:
 - `WORKER_API_BASE_URL` (default `http://localhost:7070`)

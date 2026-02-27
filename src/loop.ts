@@ -26,8 +26,9 @@ function usage(): string {
     '  loop db:migrate',
     '  loop tick',
     '  loop status',
-    '  loop tasks:list [--status queued|leased|running|done|failed|blocked]',
+    '  loop tasks:list [--status queued|leased|running|waiting_children|done|failed|blocked]',
     '  loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]',
+    '  loop tasks:create-child <parent-task-id> --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]',
     '  loop events:tail [--limit N]',
     '  loop responsibilities:list',
     '  loop steps:list <task-id>',
@@ -64,11 +65,11 @@ function parseTaskStatus(value: string | undefined): TaskStatus | undefined {
     return undefined;
   }
 
-  if (value === 'queued' || value === 'leased' || value === 'running' || value === 'done' || value === 'failed' || value === 'blocked') {
+  if (value === 'queued' || value === 'leased' || value === 'running' || value === 'waiting_children' || value === 'done' || value === 'failed' || value === 'blocked') {
     return value;
   }
 
-  throw new Error('--status must be one of: queued|leased|running|done|failed|blocked');
+  throw new Error('--status must be one of: queued|leased|running|waiting_children|done|failed|blocked');
 }
 
 function withRepo<T>(fn: (repo: QueueRepository) => T): T {
@@ -122,6 +123,7 @@ async function main(): Promise<void> {
         queued: tasks.filter((t) => t.status === 'queued').length,
         leased: tasks.filter((t) => t.status === 'leased').length,
         running: tasks.filter((t) => t.status === 'running').length,
+        waiting_children: tasks.filter((t) => t.status === 'waiting_children').length,
         done: tasks.filter((t) => t.status === 'done').length,
         failed: tasks.filter((t) => t.status === 'failed').length,
         blocked: tasks.filter((t) => t.status === 'blocked').length
@@ -172,6 +174,50 @@ async function main(): Promise<void> {
 
     printJson({
       id: task.id,
+      status: task.status,
+      created_at: task.created_at
+    });
+    return;
+  }
+
+  if (command === 'tasks:create-child') {
+    const parsed = parseCliArgs(args.slice(1));
+    const parentTaskId = parsed.positional[0];
+    if (!parentTaskId) {
+      throw new Error('tasks:create-child requires <parent-task-id>');
+    }
+
+    const prompt = parsed.named.get('--prompt')?.trim() ?? '';
+    if (!prompt) {
+      throw new Error('tasks:create-child requires --prompt');
+    }
+
+    const priorityRaw = parsed.named.get('--priority');
+    const priority = priorityRaw ? Number(priorityRaw) : undefined;
+    if (priorityRaw) {
+      const parsedPriority = Number(priorityRaw);
+      if (!Number.isInteger(parsedPriority) || parsedPriority < 1 || parsedPriority > 5) {
+        throw new Error('--priority must be an integer between 1 and 5');
+      }
+    }
+
+    const config = loadQueueConfig();
+    const task = withRepo((repo) => repo.createChildTask(
+      parentTaskId,
+      {
+        prompt,
+        successCriteria: parsed.named.get('--success') ?? undefined,
+        type: parsed.named.get('--type') ?? undefined,
+        title: parsed.named.get('--title') ?? undefined,
+        priority: priority ?? undefined
+      },
+      config.maxAttempts,
+      { maxChildDepth: config.maxChildDepth, maxChildrenPerTask: config.maxChildrenPerTask }
+    ));
+
+    printJson({
+      id: task.id,
+      parent_task_id: parentTaskId,
       status: task.status,
       created_at: task.created_at
     });
