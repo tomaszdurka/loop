@@ -383,6 +383,9 @@ function evaluateVerifyPass(verify: Record<string, unknown>): boolean {
   if (verify.pass === true) {
     return true;
   }
+  if (verify.passed === true) {
+    return true;
+  }
   if (verify.success === true) {
     return true;
   }
@@ -393,6 +396,12 @@ function evaluateVerifyPass(verify: Record<string, unknown>): boolean {
     return true;
   }
   if (verify.verification_status === 'success') {
+    return true;
+  }
+  if (verify.verification_status === 'passed') {
+    return true;
+  }
+  if (verify.status === 'success' || verify.status === 'passed') {
     return true;
   }
   return false;

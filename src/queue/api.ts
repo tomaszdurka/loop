@@ -205,6 +205,10 @@ export function startQueueApi(): void {
         const writeNdjson = (obj: unknown): void => {
           res.write(`${JSON.stringify(obj)}\n`);
         };
+        const nextSequence = (): number => {
+          lastSequence += 1;
+          return lastSequence;
+        };
         const streamEventRow = (event: {
           phase: string;
           level: string;
@@ -216,24 +220,34 @@ export function startQueueApi(): void {
             const data = JSON.parse(event.data_json) as { envelope?: unknown };
             if (data.envelope && typeof data.envelope === 'object') {
               const envelope = data.envelope as Record<string, unknown>;
-              const seq = envelope.sequence;
               const runId = envelope.run_id;
               if (typeof runId === 'string' && runId.length > 0) {
                 runIdForStream = runId;
               }
-              if (typeof seq === 'number' && Number.isInteger(seq) && seq > lastSequence) {
-                lastSequence = seq;
+              const sourceSequence = envelope.sequence;
+              const normalized = { ...envelope, sequence: nextSequence() } as Record<string, unknown>;
+              const payloadValue = normalized.payload;
+              if (
+                typeof sourceSequence === 'number'
+                && Number.isInteger(sourceSequence)
+                && payloadValue
+                && typeof payloadValue === 'object'
+                && !Array.isArray(payloadValue)
+              ) {
+                normalized.payload = {
+                  ...(payloadValue as Record<string, unknown>),
+                  source_sequence: sourceSequence
+                };
               }
-              writeNdjson(envelope);
+              writeNdjson(normalized);
               return;
             }
 
             // For non-envelope records (interpret/plan/policy/verify/report, etc.),
             // emit a normalized NDJSON event so full-mode progress is visible live.
-            lastSequence += 1;
             writeNdjson({
               run_id: runIdForStream ?? task.id,
-              sequence: lastSequence,
+              sequence: nextSequence(),
               timestamp: event.created_at,
               type: 'event',
               phase: event.phase,
@@ -245,10 +259,9 @@ export function startQueueApi(): void {
               }
             });
           } catch {
-            lastSequence += 1;
             writeNdjson({
               run_id: runIdForStream ?? task.id,
-              sequence: lastSequence,
+              sequence: nextSequence(),
               timestamp: event.created_at,
               type: 'event',
               phase: event.phase,
@@ -296,14 +309,13 @@ export function startQueueApi(): void {
           if (!refreshed) {
             writeNdjson({
               run_id: task.id,
-              sequence: lastSequence + 1,
+              sequence: nextSequence(),
               timestamp: new Date().toISOString(),
               type: 'error',
               phase: 'execute',
               producer: 'system',
               payload: { code: 'TASK_DISAPPEARED', message: 'task disappeared during wait' }
             });
-            lastSequence += 1;
             res.end();
             return;
           }
@@ -323,14 +335,13 @@ export function startQueueApi(): void {
         if (!isTerminalStatus(latest.status)) {
           writeNdjson({
             run_id: task.id,
-            sequence: lastSequence + 1,
+            sequence: nextSequence(),
             timestamp: new Date().toISOString(),
             type: 'error',
             phase: 'execute',
             producer: 'system',
             payload: { code: 'RUN_WAIT_TIMEOUT', message: 'run wait timeout reached' }
           });
-          lastSequence += 1;
           res.end();
           return;
         }
@@ -349,7 +360,7 @@ export function startQueueApi(): void {
 
         writeNdjson({
           run_id: runIdForStream ?? task.id,
-          sequence: lastSequence + 1,
+          sequence: nextSequence(),
           timestamp: new Date().toISOString(),
           type: 'artifact',
           phase: 'execute',
@@ -360,7 +371,6 @@ export function startQueueApi(): void {
             content: extractUserOutput(output)
           }
         });
-        lastSequence += 1;
         res.end();
         return;
       }
