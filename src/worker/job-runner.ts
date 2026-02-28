@@ -628,14 +628,35 @@ export async function runLeasedJob(
         data: { mode: 'lean' }
       });
 
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started');
+      const executePrompt = buildPhasePrompt(
+        basePrompt,
+        [
+          '# Execute Phase',
+          '',
+          'Role:',
+          '- Execute this task directly with minimal overhead.',
+          '',
+          'Return JSON only with shape:',
+          '{',
+          '  "status": "succeeded|failed",',
+          '  "summary": "string",',
+          '  "evidence": ["string"],',
+          '  "artifacts": ["string"],',
+          '  "errors": ["string"]',
+          '}'
+        ].join('\n'),
+        { task, mode: effectiveMode }
+      );
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started', {
+        llm_prompt: executePrompt
+      });
       const executeActionId = `a_${randomUUID().slice(0, 8)}`;
       const executeIdempotencyKey = `ik:${task.id}:execute:${executeActionId}`;
       await executeStreamer.emitAction({
         action_id: executeActionId,
         step_id: 'S_EXEC',
         tool: 'llm_execute',
-        arguments: { prompt: task.prompt },
+        arguments: { prompt: executePrompt },
         idempotency_key: executeIdempotencyKey
       });
 
@@ -645,25 +666,7 @@ export async function runLeasedJob(
         options.streamJobLogs,
         runLabel,
         'execute',
-        buildPhasePrompt(
-          basePrompt,
-          [
-            '# Execute Phase',
-            '',
-            'Role:',
-            '- Execute this task directly with minimal overhead.',
-            '',
-            'Return JSON only with shape:',
-            '{',
-            '  "status": "succeeded|failed",',
-            '  "summary": "string",',
-            '  "evidence": ["string"],',
-            '  "artifacts": ["string"],',
-            '  "errors": ["string"]',
-            '}'
-          ].join('\n'),
-          { task, mode: effectiveMode }
-        ),
+        executePrompt,
         phaseTimeoutMs
       );
       await executeStreamer.emitToolResult({
@@ -872,7 +875,28 @@ export async function runLeasedJob(
       return true;
     }
 
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started');
+    const executePrompt = buildPhasePrompt(
+      basePrompt,
+      [
+        '# Execute Phase',
+        '',
+        'Role:',
+        '- Execute the planned work now and return structured results.',
+        '',
+        'Return JSON only with shape:',
+        '{',
+        '  "status": "succeeded|failed",',
+        '  "summary": "string",',
+        '  "evidence": ["string"],',
+        '  "artifacts": ["string"],',
+        '  "errors": ["string"]',
+        '}'
+      ].join('\n'),
+      { task, interpret, plan, execution_policy: executionPolicy }
+    );
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started', {
+      llm_prompt: executePrompt
+    });
     await executeStreamer.emitStateChange({ from: 'pending', to: 'running' });
     await executeStreamer.emitEvent({
       level: 'info',
@@ -885,7 +909,7 @@ export async function runLeasedJob(
       action_id: executeActionId,
       step_id: 'S_EXEC',
       tool: 'llm_execute',
-      arguments: { prompt: task.prompt },
+      arguments: { prompt: executePrompt },
       idempotency_key: executeIdempotencyKey
     });
 
@@ -895,25 +919,7 @@ export async function runLeasedJob(
       options.streamJobLogs,
       runLabel,
       'execute',
-      buildPhasePrompt(
-        basePrompt,
-        [
-          '# Execute Phase',
-          '',
-          'Role:',
-          '- Execute the planned work now and return structured results.',
-          '',
-          'Return JSON only with shape:',
-          '{',
-          '  "status": "succeeded|failed",',
-          '  "summary": "string",',
-          '  "evidence": ["string"],',
-          '  "artifacts": ["string"],',
-          '  "errors": ["string"]',
-          '}'
-        ].join('\n'),
-        { task, interpret, plan, execution_policy: executionPolicy }
-      ),
+      executePrompt,
       phaseTimeoutMs,
       executeSchemaOverride
     );
