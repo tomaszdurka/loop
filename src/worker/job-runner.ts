@@ -261,7 +261,6 @@ function buildProviderCommand(
     if (schema) {
       args.push('--json-schema', schema.schemaJson);
     }
-    console.log('[job-runner] provider=claude args=', args);
     return {
       command: 'claude',
       args,
@@ -274,7 +273,6 @@ function buildProviderCommand(
     args.push('--output-schema', schema.schemaPath);
   }
   args.push(prompt);
-  console.log('[job-runner] provider=codex args=', args);
   return {
     command: 'codex',
     args,
@@ -379,6 +377,25 @@ function asStringArray(value: unknown): string[] {
     return [];
   }
   return value.filter((x) => typeof x === 'string') as string[];
+}
+
+function evaluateVerifyPass(verify: Record<string, unknown>): boolean {
+  if (verify.pass === true) {
+    return true;
+  }
+  if (verify.success === true) {
+    return true;
+  }
+  if (verify.verified === true) {
+    return true;
+  }
+  if (verify.success_criteria_met === true) {
+    return true;
+  }
+  if (verify.verification_status === 'success') {
+    return true;
+  }
+  return false;
 }
 
 function getByPath(root: Record<string, unknown>, path: string): unknown {
@@ -653,6 +670,9 @@ export async function runLeasedJob(
         format: 'json',
         content: execute
       }, 'system');
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution completed', {
+        output: execute
+      });
 
       let verify: Record<string, unknown>;
       if (task.success_criteria && task.success_criteria.trim().length > 0) {
@@ -669,6 +689,9 @@ export async function runLeasedJob(
           }),
           phaseTimeoutMs
         );
+        await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification completed', {
+          output: verify
+        });
       } else {
         const pass = execute.status === 'succeeded';
         verify = {
@@ -696,8 +719,11 @@ export async function runLeasedJob(
         }),
         phaseTimeoutMs
       );
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting completed', {
+        output: report
+      });
 
-      const pass = verify.pass === true;
+      const pass = evaluateVerifyPass(verify);
       await complete(baseUrl, workerId, task.id, {
         worker_exit_code: 0,
         output_json: {
@@ -733,6 +759,9 @@ export async function runLeasedJob(
       }),
       phaseTimeoutMs
     );
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'interpret', 'info', 'Interpretation completed', {
+      output: interpret
+    });
 
     const criticalBlocker = interpret.critical_blocker === true;
     const requestedBlockedRoute = interpret.route === 'blocked_for_clarification';
@@ -776,6 +805,9 @@ export async function runLeasedJob(
       buildPhasePrompt(basePrompt, planPrompt, { task, interpret }),
       phaseTimeoutMs
     );
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'plan', 'info', 'Planning completed', {
+      output: plan
+    });
 
     await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execution policy started');
     const executionPolicy = await runPhase(
@@ -787,6 +819,9 @@ export async function runLeasedJob(
       buildPhasePrompt(basePrompt, policyPrompt, { task, interpret, plan }),
       phaseTimeoutMs
     );
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execution policy completed', {
+      output: executionPolicy
+    });
     const executeSchemaOverride = resolveExecuteSchemaOverride(runDir, plan);
     if (executeSchemaOverride) {
       await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execute schema enforced from plan', {
@@ -886,6 +921,9 @@ export async function runLeasedJob(
       format: 'json',
       content: execute
     }, 'system');
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution completed', {
+      output: execute
+    });
 
     await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification started');
     const verify = await runPhase(
@@ -903,6 +941,9 @@ export async function runLeasedJob(
       }),
       phaseTimeoutMs
     );
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification completed', {
+      output: verify
+    });
 
     await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting started');
     const report = await runPhase(
@@ -918,8 +959,11 @@ export async function runLeasedJob(
       }),
       phaseTimeoutMs
     );
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting completed', {
+      output: report
+    });
 
-    const pass = verify.pass === true;
+    const pass = evaluateVerifyPass(verify);
     const outputJson = {
       mode: { configured: configuredMode, effective: effectiveMode, classifier: modeDecision },
       idempotency_key: idempotencyKey,
