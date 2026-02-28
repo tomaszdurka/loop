@@ -121,7 +121,7 @@ export function startQueueApi(): void {
         return;
       }
 
-      if (method === 'POST' && url.pathname === '/queue') {
+      if (method === 'POST' && url.pathname === '/tasks/queue') {
         const body = await readJsonBody(req) as {
           prompt?: unknown;
           success_criteria?: unknown;
@@ -158,7 +158,7 @@ export function startQueueApi(): void {
         return;
       }
 
-      if (method === 'POST' && url.pathname === '/run') {
+      if (method === 'POST' && url.pathname === '/tasks/run') {
         const body = await readJsonBody(req) as {
           prompt?: unknown;
           success_criteria?: unknown;
@@ -184,7 +184,7 @@ export function startQueueApi(): void {
 
         const type = typeof body.type === 'string' ? body.type.trim() : undefined;
         const title = typeof body.title === 'string' ? body.title.trim() : undefined;
-        const priority = Number.isInteger(body.priority) ? Number(body.priority) : undefined;
+        const priority = Number.isInteger(body.priority) ? Number(body.priority) : 1;
         const metadata = body.metadata && typeof body.metadata === 'object' ? body.metadata as Record<string, unknown> : undefined;
         const mode = body.mode === 'lean' || body.mode === 'full' || body.mode === 'auto'
           ? body.mode as TaskMode
@@ -205,6 +205,20 @@ export function startQueueApi(): void {
         const writeNdjson = (obj: unknown): void => {
           res.write(`${JSON.stringify(obj)}\n`);
         };
+
+        writeNdjson({
+          run_id: task.id,
+          sequence: 0,
+          timestamp: new Date().toISOString(),
+          type: 'event',
+          phase: 'intake',
+          producer: 'system',
+          payload: {
+            level: 'info',
+            message: 'Task accepted',
+            data: { task_id: task.id, status: task.status, queue_priority: task.priority }
+          }
+        });
 
         let latest = repo.getTaskById(task.id) ?? task;
         while (!isTerminalStatus(latest.status) && Date.now() < deadline) {

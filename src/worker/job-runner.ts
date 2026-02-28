@@ -33,10 +33,13 @@ function runCommand(
   args: string[],
   cwd: string,
   stdin: string | null,
+  timeoutMs: number,
   onOutputLine?: (line: string) => void
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], cwd });
+    let settled = false;
+    let timeoutHandle: NodeJS.Timeout | null = null;
 
     let stdout = '';
     let stderr = '';
@@ -52,6 +55,17 @@ function runCommand(
       for (const line of lines) {
         onOutputLine(line);
       }
+    };
+
+    const finish = (result: CommandResult): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+      resolve(result);
     };
 
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -70,15 +84,26 @@ function runCommand(
       const message = (error as NodeJS.ErrnoException).code === 'ENOENT'
         ? `Command not found: ${command}`
         : error.message;
-      resolve({ exitCode: null, stdout, stderr, spawnError: message });
+      finish({ exitCode: null, stdout, stderr, spawnError: message });
     });
 
     child.on('close', (code) => {
       if (onOutputLine && lineBuffer.length > 0) {
         onOutputLine(lineBuffer);
       }
-      resolve({ exitCode: code, stdout, stderr, spawnError: null });
+      finish({ exitCode: code, stdout, stderr, spawnError: null });
     });
+
+    timeoutHandle = setTimeout(() => {
+      child.kill('SIGTERM');
+      setTimeout(() => child.kill('SIGKILL'), 2000).unref();
+      finish({
+        exitCode: null,
+        stdout,
+        stderr,
+        spawnError: `Command timed out after ${timeoutMs}ms`
+      });
+    }, timeoutMs);
 
     child.stdin?.end(stdin ? `${stdin}\n` : undefined);
   });
@@ -301,13 +326,14 @@ async function runPhase(
   streamJobLogs: boolean,
   runLabel: string,
   phaseName: string,
-  phasePrompt: string
+  phasePrompt: string,
+  phaseTimeoutMs: number
 ): Promise<Record<string, unknown>> {
   if (streamJobLogs) {
     console.log(`[run/${runLabel}][${phaseName}] start`);
   }
   const cmd = buildProviderCommand(provider, phasePrompt);
-  const result = await runCommand(cmd.command, cmd.args, runDir, cmd.stdin);
+  const result = await runCommand(cmd.command, cmd.args, runDir, cmd.stdin, phaseTimeoutMs);
   if (result.spawnError) {
     if (streamJobLogs) {
       console.log(`[run/${runLabel}][${phaseName}] spawn_error=${result.spawnError}`);
@@ -372,6 +398,7 @@ export async function runLeasedJob(
   baseUrl: string,
   workerId: string,
   leaseTtlMs: number,
+  phaseTimeoutMs: number,
   task: TaskRow,
   attemptId: number | null,
   options: WorkerRuntimeOptions
@@ -420,7 +447,8 @@ export async function runLeasedJob(
             prompt: task.prompt,
             success_criteria: task.success_criteria
           }
-        })
+        }),
+        phaseTimeoutMs
       );
       effectiveMode = modeDecision.mode === 'full' ? 'full' : 'lean';
     }
@@ -474,7 +502,8 @@ export async function runLeasedJob(
             '}'
           ].join('\n'),
           { task, mode: effectiveMode }
-        )
+        ),
+        phaseTimeoutMs
       );
       await executeStreamer.emitToolResult({
         action_id: executeActionId,
@@ -502,7 +531,8 @@ export async function runLeasedJob(
           buildPhasePrompt(basePrompt, verifyPrompt, {
             task,
             execute_result: execute
-          })
+          }),
+          phaseTimeoutMs
         );
       } else {
         const pass = execute.status === 'succeeded';
@@ -528,7 +558,8 @@ export async function runLeasedJob(
           task,
           verify,
           execute_result: execute
-        })
+        }),
+        phaseTimeoutMs
       );
 
       const pass = verify.pass === true;
@@ -564,7 +595,8 @@ export async function runLeasedJob(
           type: task.type,
           title: task.title
         }
-      })
+      }),
+      phaseTimeoutMs
     );
 
     const criticalBlocker = interpret.critical_blocker === true;
@@ -606,7 +638,8 @@ export async function runLeasedJob(
       options.streamJobLogs,
       runLabel,
       'plan',
-      buildPhasePrompt(basePrompt, planPrompt, { task, interpret })
+      buildPhasePrompt(basePrompt, planPrompt, { task, interpret }),
+      phaseTimeoutMs
     );
 
     await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execution policy started');
@@ -616,7 +649,8 @@ export async function runLeasedJob(
       options.streamJobLogs,
       runLabel,
       'policy',
-      buildPhasePrompt(basePrompt, policyPrompt, { task, interpret, plan })
+      buildPhasePrompt(basePrompt, policyPrompt, { task, interpret, plan }),
+      phaseTimeoutMs
     );
 
     const idempotencyKey = computeIdempotencyKey(task, interpret, executionPolicy);
@@ -693,7 +727,8 @@ export async function runLeasedJob(
           '}'
         ].join('\n'),
         { task, interpret, plan, execution_policy: executionPolicy }
-      )
+      ),
+      phaseTimeoutMs
     );
     await executeStreamer.emitToolResult({
       action_id: executeActionId,
@@ -722,7 +757,8 @@ export async function runLeasedJob(
         plan,
         execution_policy: executionPolicy,
         execute_result: execute
-      })
+      }),
+      phaseTimeoutMs
     );
 
     await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting started');
@@ -736,7 +772,8 @@ export async function runLeasedJob(
         task,
         verify,
         execute_result: execute
-      })
+      }),
+      phaseTimeoutMs
     );
 
     const pass = verify.pass === true;

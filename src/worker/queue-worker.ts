@@ -37,6 +37,7 @@ export async function startQueueWorker(options: WorkerRuntimeOptions): Promise<v
         config.apiBaseUrl,
         workerId,
         config.leaseTtlMs,
+        config.phaseTimeoutMs,
         leased.task,
         leased.attemptId,
         options

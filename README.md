@@ -47,19 +47,19 @@ npm run loop -- gateway
 npm run loop -- worker --provider claude --stream-job-logs
 ```
 
-4. Queue task (`/queue` returns task id):
+4. Queue task (`/tasks/queue` returns task id):
 
 ```bash
-curl -sS -X POST http://localhost:7070/queue \
+curl -sS -X POST http://localhost:7070/tasks/queue \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Build a landing page for dog lovers","success_criteria":"A landing page file exists and is wired into project","mode":"auto"}' \
 | jq
 ```
 
-5. Run and wait with NDJSON stream (`/run`):
+5. Run and wait with NDJSON stream (`/tasks/run`):
 
 ```bash
-curl -sS -N -X POST http://localhost:7070/run \
+curl -sS -N -X POST http://localhost:7070/tasks/run \
   -H 'Content-Type: application/json' \
   -d '{
     "prompt":"what are the figurines in 17th minifigurines lego series",
@@ -78,8 +78,8 @@ npm run loop -- events:tail --limit 50
 
 ## REST API
 
-- `POST /queue` (queue task, returns `task_id`)
-- `POST /run` (run and stream NDJSON envelopes)
+- `POST /tasks/queue` (queue task, returns `task_id`)
+- `POST /tasks/run` (run and stream NDJSON envelopes; first event is immediate task acceptance)
 - `GET /tasks`
 - `GET /tasks/:id`
 - `GET /tasks/:id/attempts`
@@ -92,7 +92,7 @@ npm run loop -- events:tail --limit 50
 - `GET /state/:key`
 - `POST /state/:key`
 
-`POST /queue` and `POST /run` accept optional `mode`:
+`POST /tasks/queue` and `POST /tasks/run` accept optional `mode`:
 - `auto` (default): tiny classifier decides `lean` or `full`
 - `lean`: execute -> verify -> report
 - `full`: interpret -> plan -> policy -> execute -> verify -> report
@@ -119,3 +119,4 @@ Worker:
 - `WORKER_API_BASE_URL` (default `http://localhost:7070`)
 - `WORKER_POLL_MS` (default `2000`)
 - `WORKER_LEASE_TTL_MS` (default `120000`)
+- `WORKER_PHASE_TIMEOUT_MS` (default `600000`)

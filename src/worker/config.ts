@@ -2,6 +2,7 @@ export type WorkerConfig = {
   apiBaseUrl: string;
   pollMs: number;
   leaseTtlMs: number;
+  phaseTimeoutMs: number;
 };
 
 function intFromEnv(name: string, fallback: number): number {
@@ -24,6 +25,7 @@ export function loadWorkerConfig(): WorkerConfig {
   return {
     apiBaseUrl: apiBaseUrlRaw.replace(/\/+$/, ''),
     pollMs: intFromEnv('WORKER_POLL_MS', intFromEnv('QUEUE_POLL_MS', 2000)),
-    leaseTtlMs: intFromEnv('WORKER_LEASE_TTL_MS', intFromEnv('QUEUE_LEASE_TTL_MS', 120000))
+    leaseTtlMs: intFromEnv('WORKER_LEASE_TTL_MS', intFromEnv('QUEUE_LEASE_TTL_MS', 120000)),
+    phaseTimeoutMs: intFromEnv('WORKER_PHASE_TIMEOUT_MS', 10 * 60 * 1000)
   };
 }
