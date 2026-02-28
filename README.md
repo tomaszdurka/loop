@@ -1,12 +1,14 @@
-# loop
+# agentic-loop (vNext)
 
-`loop` is a local orchestration tool with a durable task lifecycle.
+Local durable queue with a phase-based LLM worker pipeline.
 
-It now runs on a unified model:
-1. one canonical `tasks` queue (lease/retry/status)
-2. internal `events` timeline
-3. internal `state` checkpoints
-4. recurring `responsibilities` that dispatch tasks on each tick
+Core lifecycle:
+1. queue task
+2. lease task
+3. run phases (interpret -> plan -> policy -> execute -> verify -> report)
+4. complete attempt
+
+All system prompts are Markdown files in `prompts/system/`.
 
 ## Install
 
@@ -17,111 +19,85 @@ npm install
 ## Commands
 
 - `loop gateway`
-- `loop worker [--stream-job-logs]`
-- `loop run "<prompt>" [--success "..."] [--provider codex|claude] [--max-iterations N] [--cwd "/path"]`
-- `loop run-job <task-id> [--stream-job-logs]`
+- `loop worker [--provider codex|claude] [--stream-job-logs]`
 - `loop db:migrate`
-- `loop tick`
 - `loop status`
-- `loop tasks:list [--status queued|leased|running|waiting_children|done|failed|blocked]`
-- `loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]`
-- `loop tasks:create-child <parent-task-id> --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]`
-- `loop events:tail [--limit N]`
-- `loop responsibilities:list`
-- `loop steps:list <task-id>`
-- `loop artifacts:list [--task-id ID] [--limit N]`
+- `loop tasks:list [--status queued|leased|running|done|failed|blocked]`
+- `loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."] [--mode auto|lean|full]`
+- `loop events:tail [--limit N] [--task-id ID]`
+- `loop run "<prompt>" [--success "..."] [--provider codex|claude] [--max-iterations N] [--cwd "/path"]`
 
-Equivalent via npm:
+## Quick Start
 
-```bash
-npm run loop -- <command...>
-```
-
-## Quick Flow
-
-1. Initialize schema:
+1. Initialize DB:
 
 ```bash
 npm run loop -- db:migrate
 ```
 
-2. Start gateway (terminal A):
+2. Start gateway:
 
 ```bash
 npm run loop -- gateway
 ```
 
-3. Start worker (terminal B):
+3. Start worker:
 
 ```bash
-npm run loop -- worker --stream-job-logs
+npm run loop -- worker --provider claude --stream-job-logs
 ```
 
-4. Run a heartbeat tick to dispatch due responsibilities:
+4. Create task:
 
 ```bash
-npm run loop -- tick
+curl -sS -X POST http://localhost:7070/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Build a landing page for dog lovers","success_criteria":"A landing page file exists and is wired into project","mode":"auto"}'
 ```
 
-5. Or create a task directly:
-
-```bash
-npm run loop -- tasks:create --prompt "Check outstanding tasks and progress one" --type maintenance --title "Progress outstanding tasks"
-```
-
-6. Check status:
+5. Inspect:
 
 ```bash
 npm run loop -- status
+npm run loop -- tasks:list
+npm run loop -- events:tail --limit 50
 ```
 
 ## REST API
 
-Canonical task API:
 - `POST /tasks`
-- `POST /tasks/:id/children`
-- `GET /tasks/:id/children`
+- `GET /tasks`
 - `GET /tasks/:id`
-- `GET /tasks/:id/steps`
-- `GET /tasks?status=queued|leased|running|waiting_children|done|failed|blocked`
 - `POST /tasks/lease`
-- `POST /tasks/:id/lease`
 - `POST /tasks/:id/heartbeat`
+- `POST /tasks/:id/events`
 - `POST /tasks/:id/complete`
-- `GET /events?limit=N`
-- `GET /artifacts?task_id=<id>&limit=N`
-- `GET /responsibilities`
-- `POST /tick`
+- `GET /events?task_id=<id>&limit=<n>`
+- `GET /state/:key`
+- `POST /state/:key`
 
-Backward compatibility aliases exist for `/jobs*` routes.
+`POST /tasks` accepts optional `mode`:
+- `auto` (default): tiny classifier decides `lean` or `full`
+- `lean`: execute -> verify -> report
+- `full`: interpret -> plan -> policy -> execute -> verify -> report
 
-## Optional step markers for checkpointing
+## Prompts
 
-If your task output includes markers in this format, they are stored in `task_steps`:
-
-```text
-STEP[fetch_emails]: DONE idempotency=inbox-sync-2026-02-27 note=Fetched 12 emails
-STEP[reply_draft]: FAILED idempotency=reply-abc123 note=Model refused
-```
-
-## Parent-child tasks (V2)
-
-- Create a parent task with `tasks:create`.
-- Create durable child tasks with `tasks:create-child <parent-task-id> ...` or `POST /tasks/:id/children`.
-- Parent transitions to `waiting_children` while children are active.
-- When all children finish:
-  - parent goes to `queued` if all children succeeded
-  - parent goes to `blocked` if any child failed/blocked
+- `prompts/system/00_executor_base.md`
+- `prompts/system/05_mode_classifier.md`
+- `prompts/system/10_interpret.md`
+- `prompts/system/20_plan.md`
+- `prompts/system/30_execution_policy.md`
+- `prompts/system/40_verify.md`
+- `prompts/system/50_report.md`
 
 ## Env Vars
 
 Gateway:
-- `QUEUE_DB_PATH` (default `./data/queue.sqlite`)
+- `QUEUE_DB_PATH` (default `./data/queue-vnext.sqlite`)
 - `QUEUE_LEASE_TTL_MS` (default `120000`)
 - `QUEUE_MAX_ATTEMPTS` (default `3`)
 - `QUEUE_API_PORT` (default `7070`)
-- `QUEUE_MAX_CHILD_DEPTH` (default `1`)
-- `QUEUE_MAX_CHILDREN_PER_TASK` (default `5`)
 
 Worker:
 - `WORKER_API_BASE_URL` (default `http://localhost:7070`)

@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -6,34 +7,38 @@ import type { TaskRow } from '../queue/types.js';
 
 export type WorkerRuntimeOptions = {
   streamJobLogs: boolean;
+  provider: 'codex' | 'claude';
 };
 
 type CommandResult = {
   exitCode: number | null;
-  output: string;
+  stdout: string;
+  stderr: string;
   spawnError: string | null;
 };
 
 type LeaseResponse = {
   task: TaskRow | null;
   attempt_no?: number;
+  attempt_id?: number;
 };
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const RUNS_ROOT = resolve(PROJECT_ROOT, 'runs');
-const LOOP_ENTRYPOINT = resolve(PROJECT_ROOT, 'src', 'loop.ts');
 const SYSTEM_PROMPTS_DIR = resolve(PROJECT_ROOT, 'prompts', 'system');
 
 function runCommand(
   command: string,
   args: string[],
   cwd: string,
+  stdin: string | null,
   onOutputLine?: (line: string) => void
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], cwd });
+    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], cwd });
 
-    let output = '';
+    let stdout = '';
+    let stderr = '';
     let lineBuffer = '';
 
     const emitLines = (chunkText: string): void => {
@@ -50,13 +55,13 @@ function runCommand(
 
     child.stdout?.on('data', (chunk: Buffer) => {
       const text = chunk.toString();
-      output += text;
+      stdout += text;
       emitLines(text);
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString();
-      output += text;
+      stderr += text;
       emitLines(text);
     });
 
@@ -64,15 +69,17 @@ function runCommand(
       const message = (error as NodeJS.ErrnoException).code === 'ENOENT'
         ? `Command not found: ${command}`
         : error.message;
-      resolve({ exitCode: null, output, spawnError: message });
+      resolve({ exitCode: null, stdout, stderr, spawnError: message });
     });
 
     child.on('close', (code) => {
       if (onOutputLine && lineBuffer.length > 0) {
         onOutputLine(lineBuffer);
       }
-      resolve({ exitCode: code, output, spawnError: null });
+      resolve({ exitCode: code, stdout, stderr, spawnError: null });
     });
+
+    child.stdin?.end(stdin ? `${stdin}\n` : undefined);
   });
 }
 
@@ -96,20 +103,16 @@ async function postJson<T>(baseUrl: string, path: string, body: unknown): Promis
   return parsed as T;
 }
 
-export async function leaseNextJob(baseUrl: string, workerId: string, leaseTtlMs: number): Promise<TaskRow | null> {
+export async function leaseNextJob(baseUrl: string, workerId: string, leaseTtlMs: number): Promise<{ task: TaskRow | null; attemptNo: number | null; attemptId: number | null }> {
   const leased = await postJson<LeaseResponse>(baseUrl, '/tasks/lease', {
     worker_id: workerId,
     lease_ttl_ms: leaseTtlMs
   });
-  return leased.task;
-}
-
-export async function leaseJobById(baseUrl: string, workerId: string, leaseTtlMs: number, jobId: string): Promise<TaskRow | null> {
-  const leased = await postJson<LeaseResponse>(baseUrl, `/tasks/${encodeURIComponent(jobId)}/lease`, {
-    worker_id: workerId,
-    lease_ttl_ms: leaseTtlMs
-  });
-  return leased.task;
+  return {
+    task: leased.task,
+    attemptNo: leased.attempt_no ?? null,
+    attemptId: leased.attempt_id ?? null
+  };
 }
 
 async function heartbeat(baseUrl: string, workerId: string, taskId: string, leaseTtlMs: number): Promise<void> {
@@ -119,12 +122,32 @@ async function heartbeat(baseUrl: string, workerId: string, taskId: string, leas
   });
 }
 
+async function pushEvent(
+  baseUrl: string,
+  taskId: string,
+  workerId: string,
+  attemptId: number | null,
+  phase: string,
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  data?: Record<string, unknown>
+): Promise<void> {
+  await postJson(baseUrl, `/tasks/${encodeURIComponent(taskId)}/events`, {
+    worker_id: workerId,
+    attempt_id: attemptId,
+    phase,
+    level,
+    message,
+    data: data ?? {}
+  });
+}
+
 async function complete(baseUrl: string, workerId: string, taskId: string, payload: {
   worker_exit_code: number | null;
-  judge_decision: 'YES' | 'NO' | null;
-  judge_explanation: string | null;
-  output: string;
+  output_json: Record<string, unknown>;
+  final_phase: string;
   succeeded: boolean;
+  blocked: boolean;
   error_message: string | null;
   finished_at: string;
 }): Promise<void> {
@@ -145,71 +168,180 @@ function createRunDir(runId: string): string {
   return runDir;
 }
 
-async function runJobViaExistingLoop(
-  task: TaskRow,
-  runDir: string,
-  runId: string,
-  streamJobLogs: boolean
-): Promise<CommandResult> {
-  const effectivePrompt = buildEffectiveTaskPrompt(task);
-  const args = [
-    'tsx',
-    LOOP_ENTRYPOINT,
-    'run',
-    effectivePrompt,
-    '--cwd',
-    runDir,
-    '--max-iterations',
-    '1'
-  ];
-
-  if (task.success_criteria) {
-    args.push('--success', task.success_criteria);
-  }
-
-  const onOutputLine = streamJobLogs
-    ? (line: string) => {
-      console.log(`[RUN#${runId}]: ${line}`);
-    }
-    : undefined;
-
-  return runCommand('npx', args, runDir, onOutputLine);
-}
-
 function readSystemPromptFile(name: string): string {
   const filePath = resolve(SYSTEM_PROMPTS_DIR, name);
   if (!existsSync(filePath)) {
-    return '';
+    throw new Error(`Missing prompt file: ${filePath}`);
   }
-
   return readFileSync(filePath, 'utf8').trim();
 }
 
-function buildEffectiveTaskPrompt(task: TaskRow): string {
-  const executor = readSystemPromptFile('executor.md');
-  const capabilities = readSystemPromptFile('capabilities.md');
-  const responsibilityDispatcher = readSystemPromptFile('responsibility-dispatcher.md');
-  const isResponsibilityTask = isTaskFromResponsibility(task);
+function buildProviderCommand(provider: 'codex' | 'claude', prompt: string): { command: string; args: string[]; stdin: string | null } {
+  if (provider === 'claude') {
+    return {
+      command: 'claude',
+      args: ['--dangerously-skip-permissions', '--print'],
+      stdin: prompt
+    };
+  }
 
-  const parts = [
-    executor ? `## System Executor\n${executor}` : '',
-    capabilities ? `## System Capabilities\n${capabilities}` : '',
-    isResponsibilityTask && responsibilityDispatcher
-      ? `## System Responsibility Dispatcher\n${responsibilityDispatcher}`
-      : '',
-    `## Task\n${task.prompt.trim()}`
-  ].filter((p) => p.length > 0);
-
-  return `${parts.join('\n\n')}\n`;
+  return {
+    command: 'codex',
+    args: ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', prompt],
+    stdin: null
+  };
 }
 
-function isTaskFromResponsibility(task: TaskRow): boolean {
-  try {
-    const payload = JSON.parse(task.payload_json) as { responsibility_id?: unknown };
-    return typeof payload.responsibility_id === 'string' && payload.responsibility_id.length > 0;
-  } catch {
-    return false;
+function buildPhasePrompt(base: string, phaseText: string, input: Record<string, unknown>): string {
+  return [
+    base,
+    '',
+    phaseText,
+    '',
+    'INPUT_JSON:',
+    JSON.stringify(input, null, 2)
+  ].join('\n');
+}
+
+function extractJsonObject(raw: string): Record<string, unknown> {
+  const fenced = raw.match(/```json\s*([\s\S]*?)```/i);
+  const direct = fenced?.[1] ?? raw;
+
+  const firstBrace = direct.indexOf('{');
+  const lastBrace = direct.lastIndexOf('}');
+  if (firstBrace < 0 || lastBrace <= firstBrace) {
+    throw new Error('No JSON object found in model output');
   }
+
+  const candidate = direct.slice(firstBrace, lastBrace + 1);
+  const parsed = JSON.parse(candidate) as unknown;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Model output JSON is not an object');
+  }
+
+  return parsed as Record<string, unknown>;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((x) => typeof x === 'string') as string[];
+}
+
+function getByPath(root: Record<string, unknown>, path: string): unknown {
+  const parts = path.split('.').map((p) => p.trim()).filter((p) => p.length > 0);
+  let current: unknown = root;
+  for (const part of parts) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+function computeIdempotencyKey(task: TaskRow, interpret: Record<string, unknown>, policy: Record<string, unknown>): string {
+  const idempotency = (policy.idempotency && typeof policy.idempotency === 'object')
+    ? policy.idempotency as Record<string, unknown>
+    : {};
+
+  const keyFields = asStringArray(idempotency.key_fields);
+  const objective = typeof interpret.objective === 'string' ? interpret.objective : '';
+
+  const source: Record<string, unknown> = {
+    task: {
+      id: task.id,
+      type: task.type,
+      title: task.title,
+      prompt: task.prompt
+    },
+    interpret: {
+      objective
+    }
+  };
+
+  const canonicalFromFields = keyFields.map((k) => `${k}=${JSON.stringify(getByPath(source, k) ?? null)}`).join('|');
+  const resolvedAny = keyFields.some((k) => getByPath(source, k) !== undefined);
+
+  const canonical = keyFields.length > 0 && resolvedAny
+    ? canonicalFromFields
+    : `${task.id}|${task.type}|${task.title}|${task.prompt}|${objective}`;
+
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+async function runPhase(
+  provider: 'codex' | 'claude',
+  runDir: string,
+  streamJobLogs: boolean,
+  runLabel: string,
+  phaseName: string,
+  phasePrompt: string
+): Promise<Record<string, unknown>> {
+  if (streamJobLogs) {
+    console.log(`[run/${runLabel}][${phaseName}] start`);
+  }
+  const cmd = buildProviderCommand(provider, phasePrompt);
+  const result = await runCommand(cmd.command, cmd.args, runDir, cmd.stdin);
+  if (result.spawnError) {
+    if (streamJobLogs) {
+      console.log(`[run/${runLabel}][${phaseName}] spawn_error=${result.spawnError}`);
+    }
+    throw new Error(result.spawnError);
+  }
+  if (result.exitCode !== 0) {
+    if (streamJobLogs) {
+      console.log(`[run/${runLabel}][${phaseName}] exit_code=${result.exitCode}`);
+    }
+    throw new Error(`${phaseName} failed with exit code ${result.exitCode}: ${result.stderr || result.stdout}`);
+  }
+
+  const parsed = extractJsonObject(result.stdout || result.stderr);
+  if (streamJobLogs) {
+    console.log(`[run/${runLabel}][${phaseName}] done`);
+  }
+  return parsed;
+}
+
+async function readState(baseUrl: string, key: string): Promise<Record<string, unknown> | null> {
+  const response = await fetch(`${baseUrl}/state/${encodeURIComponent(key)}`);
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`Failed to read state key ${key}: HTTP ${response.status}`);
+  }
+  const parsed = await response.json() as { key: string; value: Record<string, unknown> };
+  return parsed.value;
+}
+
+async function writeState(baseUrl: string, key: string, value: Record<string, unknown>): Promise<void> {
+  await postJson(baseUrl, `/state/${encodeURIComponent(key)}`, { value });
+}
+
+function getTaskMode(task: TaskRow): 'auto' | 'lean' | 'full' {
+  const maybeApiTask = task as unknown as { task_request?: unknown; task_request_json?: unknown };
+
+  try {
+    // Lease API returns task_request object; DB row uses task_request_json.
+    if (maybeApiTask.task_request && typeof maybeApiTask.task_request === 'object') {
+      const mode = (maybeApiTask.task_request as { mode?: unknown }).mode;
+      if (mode === 'lean' || mode === 'full' || mode === 'auto') {
+        return mode;
+      }
+    }
+
+    if (typeof maybeApiTask.task_request_json === 'string') {
+      const request = JSON.parse(maybeApiTask.task_request_json) as { mode?: unknown };
+      if (request.mode === 'lean' || request.mode === 'full' || request.mode === 'auto') {
+        return request.mode;
+      }
+    }
+  } catch {
+    // Ignore malformed task_request_json and fallback to auto.
+  }
+  return 'auto';
 }
 
 export async function runLeasedJob(
@@ -217,10 +349,13 @@ export async function runLeasedJob(
   workerId: string,
   leaseTtlMs: number,
   task: TaskRow,
+  attemptId: number | null,
   options: WorkerRuntimeOptions
 ): Promise<boolean> {
-  const runId = `${task.id}-${Date.now()}`;
+  const runId = `${task.id}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const runLabel = runId.split('-').pop() ?? runId;
   const runDir = createRunDir(runId);
+
   const heartbeatTimer = setInterval(() => {
     heartbeat(baseUrl, workerId, task.id, leaseTtlMs).catch((error) => {
       console.error(`[queue-worker] heartbeat failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
@@ -228,52 +363,342 @@ export async function runLeasedJob(
   }, Math.max(1000, Math.floor(leaseTtlMs / 3)));
 
   try {
-    const result = await runJobViaExistingLoop(task, runDir, runId, options.streamJobLogs);
-    const outputWithRunDir = `RUN_DIR=${runDir}\n\n${result.output}`;
+    const basePrompt = readSystemPromptFile('00_executor_base.md');
+    const modeClassifierPrompt = readSystemPromptFile('05_mode_classifier.md');
+    const interpretPrompt = readSystemPromptFile('10_interpret.md');
+    const planPrompt = readSystemPromptFile('20_plan.md');
+    const policyPrompt = readSystemPromptFile('30_execution_policy.md');
+    const verifyPrompt = readSystemPromptFile('40_verify.md');
+    const reportPrompt = readSystemPromptFile('50_report.md');
 
-    let judgeDecision: 'YES' | 'NO' | null = null;
-    let judgeExplanation: string | null = null;
+    const configuredMode = getTaskMode(task);
+    let effectiveMode: 'lean' | 'full' = 'lean';
+    let modeDecision: Record<string, unknown> | null = null;
 
-    if (task.success_criteria) {
-      const text = result.output;
-      if (/Judge decision:\s*YES/i.test(text)) {
-        judgeDecision = 'YES';
-      } else if (/Judge decision:\s*NO/i.test(text)) {
-        judgeDecision = 'NO';
-      }
-
-      const match = text.match(/Judge decision:\s*(YES|NO)\s*-\s*([^\n\r]+)/i);
-      judgeExplanation = match ? match[2].trim() : null;
+    if (configuredMode === 'lean' || configuredMode === 'full') {
+      effectiveMode = configuredMode;
+    } else {
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'mode', 'info', 'Mode classification started');
+      modeDecision = await runPhase(
+        options.provider,
+        runDir,
+        options.streamJobLogs,
+        runLabel,
+        'mode',
+        buildPhasePrompt(basePrompt, modeClassifierPrompt, {
+          task: {
+            id: task.id,
+            type: task.type,
+            title: task.title,
+            prompt: task.prompt,
+            success_criteria: task.success_criteria
+          }
+        })
+      );
+      effectiveMode = modeDecision.mode === 'full' ? 'full' : 'lean';
     }
 
-    const succeeded = result.spawnError === null && result.exitCode === 0;
-    const errorMessage = succeeded
-      ? null
-      : (result.spawnError ?? `Runner exit code ${result.exitCode ?? 'null'}`);
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'mode', 'info', 'Mode selected', {
+      configured_mode: configuredMode,
+      effective_mode: effectiveMode,
+      classifier: modeDecision
+    });
+
+    if (effectiveMode === 'lean') {
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started');
+      const execute = await runPhase(
+        options.provider,
+        runDir,
+        options.streamJobLogs,
+        runLabel,
+        'execute',
+        buildPhasePrompt(
+          basePrompt,
+          [
+            '# Execute Phase',
+            '',
+            'Role:',
+            '- Execute this task directly with minimal overhead.',
+            '',
+            'Return JSON only with shape:',
+            '{',
+            '  "status": "succeeded|failed",',
+            '  "summary": "string",',
+            '  "evidence": ["string"],',
+            '  "artifacts": ["string"],',
+            '  "errors": ["string"]',
+            '}'
+          ].join('\n'),
+          { task, mode: effectiveMode }
+        )
+      );
+
+      let verify: Record<string, unknown>;
+      if (task.success_criteria && task.success_criteria.trim().length > 0) {
+        await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification started');
+        verify = await runPhase(
+          options.provider,
+          runDir,
+          options.streamJobLogs,
+          runLabel,
+          'verify',
+          buildPhasePrompt(basePrompt, verifyPrompt, {
+            task,
+            execute_result: execute
+          })
+        );
+      } else {
+        const pass = execute.status === 'succeeded';
+        verify = {
+          pass,
+          evidence: ['Lean mode: no explicit success_criteria provided; used execute status'],
+          failures: pass ? [] : ['Execution did not return succeeded'],
+          recommended_next_actions: pass ? [] : ['Add success_criteria for stronger verification']
+        };
+        await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification skipped (no success_criteria)', {
+          fallback_pass: pass
+        });
+      }
+
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting started');
+      const report = await runPhase(
+        options.provider,
+        runDir,
+        options.streamJobLogs,
+        runLabel,
+        'report',
+        buildPhasePrompt(basePrompt, reportPrompt, {
+          task,
+          verify,
+          execute_result: execute
+        })
+      );
+
+      const pass = verify.pass === true;
+      await complete(baseUrl, workerId, task.id, {
+        worker_exit_code: 0,
+        output_json: {
+          mode: { configured: configuredMode, effective: effectiveMode, classifier: modeDecision },
+          phase_outputs: { execute, verify, report },
+          run_dir: runDir
+        },
+        final_phase: 'report',
+        succeeded: pass,
+        blocked: false,
+        error_message: pass ? null : 'Verification failed',
+        finished_at: new Date().toISOString()
+      });
+      return pass;
+    }
+
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'interpret', 'info', 'Interpretation started');
+    const interpret = await runPhase(
+      options.provider,
+      runDir,
+      options.streamJobLogs,
+      runLabel,
+      'interpret',
+      buildPhasePrompt(basePrompt, interpretPrompt, {
+        task: {
+          id: task.id,
+          prompt: task.prompt,
+          success_criteria: task.success_criteria,
+          type: task.type,
+          title: task.title
+        }
+      })
+    );
+
+    const criticalBlocker = interpret.critical_blocker === true;
+    const requestedBlockedRoute = interpret.route === 'blocked_for_clarification';
+    if (requestedBlockedRoute && criticalBlocker) {
+      const outputJson = {
+        phase_outputs: { interpret },
+        report: {
+          message_markdown: `- Outcome: blocked for clarification\n- Missing info: ${asStringArray(interpret.clarifications_needed).join('; ') || 'unspecified'}`
+        }
+      };
+
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'interpret', 'warn', 'Task blocked for clarification', {
+        clarifications_needed: interpret.clarifications_needed ?? []
+      });
+
+      await complete(baseUrl, workerId, task.id, {
+        worker_exit_code: 0,
+        output_json: outputJson,
+        final_phase: 'interpret',
+        succeeded: false,
+        blocked: true,
+        error_message: 'Blocked for clarification',
+        finished_at: new Date().toISOString()
+      });
+      return false;
+    }
+
+    if (requestedBlockedRoute && !criticalBlocker) {
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'interpret', 'warn', 'Non-critical clarification ignored; continuing', {
+        clarifications_needed: interpret.clarifications_needed ?? []
+      });
+    }
+
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'plan', 'info', 'Planning started');
+    const plan = await runPhase(
+      options.provider,
+      runDir,
+      options.streamJobLogs,
+      runLabel,
+      'plan',
+      buildPhasePrompt(basePrompt, planPrompt, { task, interpret })
+    );
+
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execution policy started');
+    const executionPolicy = await runPhase(
+      options.provider,
+      runDir,
+      options.streamJobLogs,
+      runLabel,
+      'policy',
+      buildPhasePrompt(basePrompt, policyPrompt, { task, interpret, plan })
+    );
+
+    const idempotencyKey = computeIdempotencyKey(task, interpret, executionPolicy);
+    const stateKey = `idempotency:${idempotencyKey}`;
+    const existingDone = await readState(baseUrl, stateKey);
+
+    if (existingDone) {
+      const outputJson = {
+        phase_outputs: { interpret, plan, executionPolicy },
+        dedupe: {
+          idempotency_key: idempotencyKey,
+          reused: true,
+          existing: existingDone
+        },
+        report: {
+          message_markdown: '- Outcome: deduplicated\n- Action: reused existing completion record'
+        }
+      };
+
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Deduplication hit', {
+        idempotency_key: idempotencyKey
+      });
+
+      await complete(baseUrl, workerId, task.id, {
+        worker_exit_code: 0,
+        output_json: outputJson,
+        final_phase: 'policy',
+        succeeded: true,
+        blocked: false,
+        error_message: null,
+        finished_at: new Date().toISOString()
+      });
+      return true;
+    }
+
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started');
+    const execute = await runPhase(
+      options.provider,
+      runDir,
+      options.streamJobLogs,
+      runLabel,
+      'execute',
+      buildPhasePrompt(
+        basePrompt,
+        [
+          '# Execute Phase',
+          '',
+          'Role:',
+          '- Execute the planned work now and return structured results.',
+          '',
+          'Return JSON only with shape:',
+          '{',
+          '  "status": "succeeded|failed",',
+          '  "summary": "string",',
+          '  "evidence": ["string"],',
+          '  "artifacts": ["string"],',
+          '  "errors": ["string"]',
+          '}'
+        ].join('\n'),
+        { task, interpret, plan, execution_policy: executionPolicy }
+      )
+    );
+
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification started');
+    const verify = await runPhase(
+      options.provider,
+      runDir,
+      options.streamJobLogs,
+      runLabel,
+      'verify',
+      buildPhasePrompt(basePrompt, verifyPrompt, {
+        task,
+        interpret,
+        plan,
+        execution_policy: executionPolicy,
+        execute_result: execute
+      })
+    );
+
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting started');
+    const report = await runPhase(
+      options.provider,
+      runDir,
+      options.streamJobLogs,
+      runLabel,
+      'report',
+      buildPhasePrompt(reportPrompt, '# Input\nReturn JSON only.', {
+        task,
+        verify,
+        execute_result: execute
+      })
+    );
+
+    const pass = verify.pass === true;
+    const outputJson = {
+      mode: { configured: configuredMode, effective: effectiveMode, classifier: modeDecision },
+      idempotency_key: idempotencyKey,
+      phase_outputs: {
+        interpret,
+        plan,
+        execution_policy: executionPolicy,
+        execute,
+        verify,
+        report
+      },
+      run_dir: runDir
+    };
+
+    if (pass) {
+      await writeState(baseUrl, stateKey, {
+        task_id: task.id,
+        completed_at: new Date().toISOString(),
+        verify
+      });
+    }
 
     await complete(baseUrl, workerId, task.id, {
-      worker_exit_code: result.exitCode,
-      judge_decision: judgeDecision,
-      judge_explanation: judgeExplanation,
-      output: outputWithRunDir,
-      succeeded,
-      error_message: errorMessage,
+      worker_exit_code: 0,
+      output_json: outputJson,
+      final_phase: 'report',
+      succeeded: pass,
+      blocked: false,
+      error_message: pass ? null : 'Verification failed',
       finished_at: new Date().toISOString()
     });
 
-    console.log(`[queue-worker] task ${task.id} ${succeeded ? 'done' : 'failed_or_requeued'}`);
-    return succeeded;
+    return pass;
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await pushEvent(baseUrl, task.id, workerId, attemptId, 'runtime', 'error', 'Worker runtime error', { message });
+
     await complete(baseUrl, workerId, task.id, {
-      worker_exit_code: null,
-      judge_decision: 'NO',
-      judge_explanation: 'Worker runtime error',
-      output: `RUN_DIR=${runDir}\n\n${error instanceof Error ? error.stack ?? error.message : String(error)}`,
+      worker_exit_code: 1,
+      output_json: { error: message },
+      final_phase: 'runtime',
       succeeded: false,
-      error_message: 'Worker runtime error',
+      blocked: false,
+      error_message: message,
       finished_at: new Date().toISOString()
     });
-    console.error(`[queue-worker] task ${task.id} runtime error`);
     return false;
   } finally {
     clearInterval(heartbeatTimer);

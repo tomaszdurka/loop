@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startQueueApi } from './queue/api.js';
@@ -8,8 +7,6 @@ import { openQueueDb } from './queue/db.js';
 import { loadQueueConfig } from './queue/config.js';
 import { QueueRepository } from './queue/repository.js';
 import { runAgenticLoopCommand, type AgenticLoopConfig } from './agentic-loop-runner/index.js';
-import { loadWorkerConfig } from './worker/config.js';
-import { leaseJobById, runLeasedJob } from './worker/job-runner.js';
 import { startQueueWorker } from './worker/queue-worker.js';
 import { parseCliArgs } from './lib/cli-args.js';
 import type { TaskStatus } from './queue/types.js';
@@ -20,19 +17,13 @@ function usage(): string {
   return [
     'Usage:',
     '  loop gateway',
-    '  loop run "<prompt>" [--success "..."] [--provider codex|claude] [--max-iterations N] [--cwd "/path"]',
-    '  loop run-job <task-id> [--stream-job-logs]',
-    '  loop worker [--stream-job-logs]',
+    '  loop worker [--stream-job-logs] [--provider codex|claude]',
     '  loop db:migrate',
-    '  loop tick',
     '  loop status',
-    '  loop tasks:list [--status queued|leased|running|waiting_children|done|failed|blocked]',
-    '  loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]',
-    '  loop tasks:create-child <parent-task-id> --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."]',
-    '  loop events:tail [--limit N]',
-    '  loop responsibilities:list',
-    '  loop steps:list <task-id>',
-    '  loop artifacts:list [--task-id ID] [--limit N]'
+    '  loop tasks:list [--status queued|leased|running|done|failed|blocked]',
+    '  loop tasks:create --prompt "..." [--type TYPE] [--title TITLE] [--priority 1..5] [--success "..."] [--mode auto|lean|full]',
+    '  loop events:tail [--limit N] [--task-id ID]',
+    '  loop run "<prompt>" [--success "..."] [--provider codex|claude] [--max-iterations N] [--cwd "/path"]'
   ].join('\n');
 }
 
@@ -65,11 +56,11 @@ function parseTaskStatus(value: string | undefined): TaskStatus | undefined {
     return undefined;
   }
 
-  if (value === 'queued' || value === 'leased' || value === 'running' || value === 'waiting_children' || value === 'done' || value === 'failed' || value === 'blocked') {
+  if (value === 'queued' || value === 'leased' || value === 'running' || value === 'done' || value === 'failed' || value === 'blocked') {
     return value;
   }
 
-  throw new Error('--status must be one of: queued|leased|running|waiting_children|done|failed|blocked');
+  throw new Error('--status must be one of: queued|leased|running|done|failed|blocked');
 }
 
 function withRepo<T>(fn: (repo: QueueRepository) => T): T {
@@ -109,13 +100,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command === 'tick') {
-    const config = loadQueueConfig();
-    const result = withRepo((repo) => repo.runDueResponsibilities(config.maxAttempts));
-    printJson(result);
-    return;
-  }
-
   if (command === 'status') {
     const data = withRepo((repo) => {
       const tasks = repo.listTasks();
@@ -123,7 +107,6 @@ async function main(): Promise<void> {
         queued: tasks.filter((t) => t.status === 'queued').length,
         leased: tasks.filter((t) => t.status === 'leased').length,
         running: tasks.filter((t) => t.status === 'running').length,
-        waiting_children: tasks.filter((t) => t.status === 'waiting_children').length,
         done: tasks.filter((t) => t.status === 'done').length,
         failed: tasks.filter((t) => t.status === 'failed').length,
         blocked: tasks.filter((t) => t.status === 'blocked').length
@@ -161,66 +144,24 @@ async function main(): Promise<void> {
     }
 
     const config = loadQueueConfig();
+    const modeRaw = parsed.named.get('--mode');
+    if (modeRaw && modeRaw !== 'auto' && modeRaw !== 'lean' && modeRaw !== 'full') {
+      throw new Error('--mode must be one of: auto|lean|full');
+    }
     const task = withRepo((repo) => repo.createTask(
       {
         prompt,
         successCriteria: parsed.named.get('--success') ?? undefined,
         type: parsed.named.get('--type') ?? undefined,
         title: parsed.named.get('--title') ?? undefined,
-        priority: priority ?? undefined
+        priority: priority ?? undefined,
+        metadata: { created_from: 'cli' },
+        mode: (modeRaw as 'auto' | 'lean' | 'full' | undefined) ?? 'auto'
       },
       config.maxAttempts
     ));
 
-    printJson({
-      id: task.id,
-      status: task.status,
-      created_at: task.created_at
-    });
-    return;
-  }
-
-  if (command === 'tasks:create-child') {
-    const parsed = parseCliArgs(args.slice(1));
-    const parentTaskId = parsed.positional[0];
-    if (!parentTaskId) {
-      throw new Error('tasks:create-child requires <parent-task-id>');
-    }
-
-    const prompt = parsed.named.get('--prompt')?.trim() ?? '';
-    if (!prompt) {
-      throw new Error('tasks:create-child requires --prompt');
-    }
-
-    const priorityRaw = parsed.named.get('--priority');
-    const priority = priorityRaw ? Number(priorityRaw) : undefined;
-    if (priorityRaw) {
-      const parsedPriority = Number(priorityRaw);
-      if (!Number.isInteger(parsedPriority) || parsedPriority < 1 || parsedPriority > 5) {
-        throw new Error('--priority must be an integer between 1 and 5');
-      }
-    }
-
-    const config = loadQueueConfig();
-    const task = withRepo((repo) => repo.createChildTask(
-      parentTaskId,
-      {
-        prompt,
-        successCriteria: parsed.named.get('--success') ?? undefined,
-        type: parsed.named.get('--type') ?? undefined,
-        title: parsed.named.get('--title') ?? undefined,
-        priority: priority ?? undefined
-      },
-      config.maxAttempts,
-      { maxChildDepth: config.maxChildDepth, maxChildrenPerTask: config.maxChildrenPerTask }
-    ));
-
-    printJson({
-      id: task.id,
-      parent_task_id: parentTaskId,
-      status: task.status,
-      created_at: task.created_at
-    });
+    printJson({ id: task.id, status: task.status, created_at: task.created_at });
     return;
   }
 
@@ -232,38 +173,20 @@ async function main(): Promise<void> {
       throw new Error('--limit must be an integer between 1 and 500');
     }
 
-    const events = withRepo((repo) => repo.listEvents(limit));
+    const taskId = parsed.named.get('--task-id') ?? undefined;
+    const events = withRepo((repo) => repo.listEvents(limit, taskId));
     printJson({ events });
     return;
   }
 
-  if (command === 'steps:list') {
-    const parsed = parseCliArgs(args.slice(1));
-    const taskId = parsed.positional[0];
-    if (!taskId) {
-      throw new Error('steps:list requires <task-id>');
+  if (command === 'worker') {
+    const workerArgs = parseCliArgs(args.slice(1));
+    const streamJobLogs = workerArgs.flags.has('--stream-job-logs');
+    const providerRaw = workerArgs.named.get('--provider') ?? 'claude';
+    if (providerRaw !== 'codex' && providerRaw !== 'claude') {
+      throw new Error('--provider must be one of: codex, claude');
     }
-    const steps = withRepo((repo) => repo.listTaskSteps(taskId));
-    printJson({ steps });
-    return;
-  }
-
-  if (command === 'artifacts:list') {
-    const parsed = parseCliArgs(args.slice(1));
-    const taskId = parsed.named.get('--task-id') ?? undefined;
-    const limitRaw = parsed.named.get('--limit') ?? '50';
-    const limit = Number(limitRaw);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
-      throw new Error('--limit must be an integer between 1 and 500');
-    }
-    const artifacts = withRepo((repo) => repo.listArtifacts(limit, taskId));
-    printJson({ artifacts });
-    return;
-  }
-
-  if (command === 'responsibilities:list') {
-    const responsibilities = withRepo((repo) => repo.listResponsibilities());
-    printJson({ responsibilities });
+    await startQueueWorker({ streamJobLogs, provider: providerRaw });
     return;
   }
 
@@ -278,40 +201,6 @@ async function main(): Promise<void> {
       console.error(usage());
       process.exit(2);
     }
-    return;
-  }
-
-  if (command === 'run-job') {
-    const runJobArgs = parseCliArgs(args.slice(1));
-    const taskId = runJobArgs.positional[0];
-    if (!taskId) {
-      console.error('run-job requires <task-id>');
-      console.error(usage());
-      process.exit(2);
-    }
-
-    const streamJobLogs = runJobArgs.flags.has('--stream-job-logs');
-    const config = loadWorkerConfig();
-    const workerId = `worker-${randomUUID()}`;
-    console.log(`[job-runner] started: ${workerId}`);
-    console.log(`[job-runner] api: ${config.apiBaseUrl}`);
-    console.log(`[job-runner] leasing task: ${taskId}`);
-
-    const task = await leaseJobById(config.apiBaseUrl, workerId, config.leaseTtlMs, taskId);
-    if (!task) {
-      console.error(`[job-runner] task ${taskId} is not available for lease`);
-      process.exit(1);
-    }
-
-    const succeeded = await runLeasedJob(config.apiBaseUrl, workerId, config.leaseTtlMs, task, { streamJobLogs });
-    process.exit(succeeded ? 0 : 1);
-    return;
-  }
-
-  if (command === 'worker') {
-    const workerArgs = parseCliArgs(args.slice(1));
-    const streamJobLogs = workerArgs.flags.has('--stream-job-logs');
-    await startQueueWorker({ streamJobLogs });
     return;
   }
 

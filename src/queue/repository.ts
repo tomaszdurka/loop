@@ -1,27 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type {
-  ArtifactRow,
   CompleteAttemptInput,
-  CreateArtifactInput,
   CreateTaskInput,
   EventRow,
-  ResponsibilityRow,
   StateRow,
-  TaskStepRow,
   TaskAttemptRow,
+  TaskAttemptStatus,
   TaskRow,
-  TaskStatus,
-  UpsertTaskStepInput
+  TaskStatus
 } from './types.js';
-import type { CompiledResponsibility } from '../responsibility/compiler.js';
 
 function nowIso(): string {
   return new Date().toISOString();
-}
-
-function normalizeStatus(status: TaskStatus | 'succeeded'): TaskStatus {
-  return status === 'succeeded' ? 'done' : status;
 }
 
 export class QueueRepository {
@@ -33,17 +24,17 @@ export class QueueRepository {
     const type = input.type?.trim() || 'generic';
     const title = input.title?.trim() || 'Untitled task';
     const successCriteria = input.successCriteria?.trim() || null;
-    const payloadJson = JSON.stringify(input.payload ?? {});
+    const metadata = input.metadata ?? {};
+    const mode = input.mode ?? 'auto';
     const priority = Number.isInteger(input.priority) ? Math.max(1, Math.min(5, input.priority!)) : 3;
     const maxAttempts = Number.isInteger(input.maxAttempts) ? Math.max(1, input.maxAttempts!) : defaultMaxAttempts;
 
     this.db
       .prepare(
         `INSERT INTO tasks (
-          id, type, title, prompt, success_criteria, payload_json, status, priority,
-          attempt_count, max_attempts, next_run_at, parent_task_id, dedupe_key,
-          lease_owner, lease_expires_at, last_error, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)`
+          id, type, title, prompt, success_criteria, task_request_json, status, priority,
+          attempt_count, max_attempts, lease_owner, lease_expires_at, last_error, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, NULL, NULL, NULL, ?, ?)`
       )
       .run(
         id,
@@ -51,73 +42,22 @@ export class QueueRepository {
         title,
         input.prompt,
         successCriteria,
-        payloadJson,
+        JSON.stringify({ metadata, source: 'api', mode }),
         priority,
         maxAttempts,
-        input.nextRunAt ?? null,
-        input.parentTaskId ?? null,
-        input.dedupeKey ?? null,
         now,
         now
       );
 
-    this.appendEvent('task_created', {
-      type,
-      title,
-      priority,
-      dedupe_key: input.dedupeKey ?? null
-    }, id);
-
-    return this.getTaskById(id)!;
-  }
-
-  createChildTask(
-    parentTaskId: string,
-    input: CreateTaskInput,
-    defaultMaxAttempts: number,
-    policy: { maxChildDepth: number; maxChildrenPerTask: number }
-  ): TaskRow {
-    const tx = this.db.transaction(() => {
-      const parent = this.getTaskById(parentTaskId);
-      if (!parent) {
-        throw new Error(`parent task not found: ${parentTaskId}`);
-      }
-
-      const depth = this.countTaskDepth(parentTaskId);
-      if (depth >= policy.maxChildDepth) {
-        throw new Error(`child depth limit reached (max=${policy.maxChildDepth})`);
-      }
-
-      const childCount = (this.db
-        .prepare('SELECT COUNT(*) as count FROM tasks WHERE parent_task_id = ?')
-        .get(parentTaskId) as { count: number }).count;
-      if (childCount >= policy.maxChildrenPerTask) {
-        throw new Error(`max children per task reached (max=${policy.maxChildrenPerTask})`);
-      }
-
-      const child = this.createTask(
-        {
-          ...input,
-          parentTaskId
-        },
-        defaultMaxAttempts
-      );
-
-      const now = nowIso();
-      this.db
-        .prepare(
-          `UPDATE tasks
-           SET status = 'waiting_children', updated_at = ?
-           WHERE id = ? AND status IN ('queued', 'leased', 'running')`
-        )
-        .run(now, parentTaskId);
-
-      this.appendEvent('child_task_created', { child_task_id: child.id }, parentTaskId);
-      this.appendEvent('child_task_linked', { parent_task_id: parentTaskId }, child.id);
-      return child;
+    this.appendEvent({
+      taskId: id,
+      phase: 'intake',
+      level: 'info',
+      message: 'Task created',
+      data: { type, title, priority }
     });
 
-    return tx();
+    return this.getTaskById(id)!;
   }
 
   getTaskById(id: string): TaskRow | null {
@@ -125,11 +65,11 @@ export class QueueRepository {
     return row ?? null;
   }
 
-  listTasks(status?: TaskStatus | 'succeeded'): TaskRow[] {
+  listTasks(status?: TaskStatus): TaskRow[] {
     if (status) {
       return this.db
         .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY priority ASC, created_at ASC')
-        .all(normalizeStatus(status)) as TaskRow[];
+        .all(status) as TaskRow[];
     }
     return this.db.prepare('SELECT * FROM tasks ORDER BY priority ASC, created_at ASC').all() as TaskRow[];
   }
@@ -155,37 +95,29 @@ export class QueueRepository {
 
       for (const task of expired) {
         const nextAttempt = task.attempt_count + 1;
-        const isFinalFailure = nextAttempt >= task.max_attempts;
-        const nextStatus: TaskStatus = isFinalFailure ? 'failed' : 'queued';
-        const message = 'Lease expired before completion';
+        const terminal = nextAttempt >= task.max_attempts;
+        const nextStatus: TaskStatus = terminal ? 'failed' : 'queued';
 
         this.db
           .prepare(
-            `INSERT INTO task_attempts (
-              task_id, attempt_no, status, worker_exit_code, judge_decision,
-              judge_explanation, output, started_at, finished_at
-            ) VALUES (?, ?, 'failed', NULL, NULL, NULL, ?, ?, ?)
-            ON CONFLICT(task_id, attempt_no) DO UPDATE SET
-              status='failed',
-              output=excluded.output,
-              finished_at=excluded.finished_at`
+            `UPDATE tasks
+             SET status = ?,
+                 attempt_count = ?,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 last_error = ?,
+                 updated_at = ?
+             WHERE id = ?`
           )
-          .run(task.id, nextAttempt, message, now, now);
+          .run(nextStatus, nextAttempt, 'Lease expired before completion', now, task.id);
 
-        this.db
-          .prepare(
-            `UPDATE tasks SET
-              status = ?,
-              attempt_count = ?,
-              lease_owner = NULL,
-              lease_expires_at = NULL,
-              last_error = ?,
-              updated_at = ?
-            WHERE id = ?`
-          )
-          .run(nextStatus, nextAttempt, message, now, task.id);
-
-        this.appendEvent('task_lease_expired', { next_status: nextStatus }, task.id);
+        this.appendEvent({
+          taskId: task.id,
+          phase: 'lease',
+          level: 'warn',
+          message: 'Lease expired',
+          data: { next_status: nextStatus }
+        });
       }
 
       return expired.length;
@@ -198,31 +130,29 @@ export class QueueRepository {
     const tx = this.db.transaction(() => {
       this.recoverExpiredLeases();
 
-      const now = nowIso();
       const candidate = this.db
         .prepare(
           `SELECT id
            FROM tasks
            WHERE status = 'queued'
-             AND (next_run_at IS NULL OR next_run_at <= ?)
            ORDER BY priority ASC, created_at ASC
            LIMIT 1`
         )
-        .get(now) as { id: string } | undefined;
+        .get() as { id: string } | undefined;
 
       if (!candidate) {
         return null;
       }
 
+      const now = nowIso();
       const leaseExpiresAt = new Date(Date.now() + leaseTtlMs).toISOString();
-
       const claimed = this.db
         .prepare(
-          `UPDATE tasks SET
-             status = 'leased',
-             lease_owner = ?,
-             lease_expires_at = ?,
-             updated_at = ?
+          `UPDATE tasks
+           SET status = 'leased',
+               lease_owner = ?,
+               lease_expires_at = ?,
+               updated_at = ?
            WHERE id = ? AND status = 'queued'`
         )
         .run(workerId, leaseExpiresAt, now, candidate.id);
@@ -231,49 +161,28 @@ export class QueueRepository {
         return null;
       }
 
-      this.appendEvent('task_leased', { worker_id: workerId, lease_expires_at: leaseExpiresAt }, candidate.id);
+      this.appendEvent({
+        taskId: candidate.id,
+        phase: 'lease',
+        level: 'info',
+        message: 'Task leased',
+        data: { worker_id: workerId, lease_expires_at: leaseExpiresAt }
+      });
+
       return this.getTaskById(candidate.id);
     });
 
     return tx();
   }
 
-  leaseTaskById(taskId: string, workerId: string, leaseTtlMs: number): TaskRow | null {
-    const tx = this.db.transaction(() => {
-      this.recoverExpiredLeases();
-
-      const now = nowIso();
-      const leaseExpiresAt = new Date(Date.now() + leaseTtlMs).toISOString();
-      const claimed = this.db
-        .prepare(
-          `UPDATE tasks SET
-             status = 'leased',
-             lease_owner = ?,
-             lease_expires_at = ?,
-             updated_at = ?
-           WHERE id = ? AND status = 'queued'`
-        )
-        .run(workerId, leaseExpiresAt, now, taskId);
-
-      if (claimed.changes !== 1) {
-        return null;
-      }
-
-      this.appendEvent('task_leased', { worker_id: workerId, lease_expires_at: leaseExpiresAt }, taskId);
-      return this.getTaskById(taskId);
-    });
-
-    return tx();
-  }
-
-  startAttempt(taskId: string, workerId: string): number {
+  startAttempt(taskId: string, workerId: string): { attemptNo: number; attemptId: number; leaseExpiresAt: string } | null {
     const tx = this.db.transaction(() => {
       const task = this.db
         .prepare(`SELECT * FROM tasks WHERE id = ? AND lease_owner = ? AND status = 'leased'`)
         .get(taskId, workerId) as TaskRow | undefined;
 
-      if (!task) {
-        return 0;
+      if (!task || !task.lease_expires_at) {
+        return null;
       }
 
       const attemptNo = task.attempt_count + 1;
@@ -286,18 +195,28 @@ export class QueueRepository {
       this.db
         .prepare(
           `INSERT INTO task_attempts (
-            task_id, attempt_no, status, worker_exit_code, judge_decision,
-            judge_explanation, output, started_at, finished_at
-          ) VALUES (?, ?, 'running', NULL, NULL, NULL, '', ?, NULL)
-          ON CONFLICT(task_id, attempt_no) DO UPDATE SET
-            status='running',
-            started_at=excluded.started_at,
-            finished_at=NULL`
+             task_id, attempt_no, lease_owner, lease_expires_at, status, phase, output_json, started_at, finished_at
+           ) VALUES (?, ?, ?, ?, 'running', 'preflight', '{}', ?, NULL)`
         )
-        .run(taskId, attemptNo, now);
+        .run(taskId, attemptNo, workerId, task.lease_expires_at, now);
 
-      this.appendEvent('task_started', { worker_id: workerId, attempt_no: attemptNo }, taskId);
-      return attemptNo;
+      const attempt = this.db
+        .prepare('SELECT * FROM task_attempts WHERE task_id = ? AND attempt_no = ?')
+        .get(taskId, attemptNo) as TaskAttemptRow | undefined;
+      if (!attempt) {
+        return null;
+      }
+
+      this.appendEvent({
+        taskId,
+        attemptId: attempt.id,
+        phase: 'preflight',
+        level: 'info',
+        message: 'Attempt started',
+        data: { attempt_no: attemptNo, worker_id: workerId }
+      });
+
+      return { attemptNo, attemptId: attempt.id, leaseExpiresAt: task.lease_expires_at };
     });
 
     return tx();
@@ -313,6 +232,18 @@ export class QueueRepository {
          WHERE id = ? AND lease_owner = ? AND status IN ('leased', 'running')`
       )
       .run(leaseExpiresAt, now, taskId, workerId);
+
+    this.db
+      .prepare(
+        `UPDATE task_attempts
+         SET lease_expires_at = ?
+         WHERE task_id = ?
+           AND lease_owner = ?
+           AND status = 'running'
+         ORDER BY attempt_no DESC
+         LIMIT 1`
+      )
+      .run(leaseExpiresAt, taskId, workerId);
   }
 
   completeAttempt(taskId: string, workerId: string, result: CompleteAttemptInput): void {
@@ -326,101 +257,103 @@ export class QueueRepository {
       }
 
       const attemptNo = task.attempt_count + 1;
-      const newAttemptCount = attemptNo;
-      const nextStatus: TaskStatus = result.succeeded
-        ? 'done'
-        : newAttemptCount >= task.max_attempts
-          ? 'failed'
-          : 'queued';
+      const attempt = this.db
+        .prepare('SELECT * FROM task_attempts WHERE task_id = ? AND attempt_no = ?')
+        .get(taskId, attemptNo) as TaskAttemptRow | undefined;
+
+      const attemptStatus: TaskAttemptStatus = result.blocked
+        ? 'blocked'
+        : result.succeeded
+          ? 'done'
+          : 'failed';
+
+      const nextStatus: TaskStatus = result.blocked
+        ? 'blocked'
+        : result.succeeded
+          ? 'done'
+          : attemptNo >= task.max_attempts
+            ? 'failed'
+            : 'queued';
+
+      if (attempt) {
+        this.db
+          .prepare(
+            `UPDATE task_attempts
+             SET status = ?, phase = ?, output_json = ?, finished_at = ?
+             WHERE id = ?`
+          )
+          .run(attemptStatus, result.finalPhase, JSON.stringify(result.outputJson), result.finishedAt, attempt.id);
+      }
 
       this.db
         .prepare(
-          `INSERT INTO task_attempts (
-             task_id, attempt_no, status, worker_exit_code, judge_decision,
-             judge_explanation, output, started_at, finished_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(task_id, attempt_no) DO UPDATE SET
-             status=excluded.status,
-             worker_exit_code=excluded.worker_exit_code,
-             judge_decision=excluded.judge_decision,
-             judge_explanation=excluded.judge_explanation,
-             output=excluded.output,
-             finished_at=excluded.finished_at`
-        )
-        .run(
-          taskId,
-          attemptNo,
-          result.succeeded ? 'done' : 'failed',
-          result.workerExitCode,
-          result.judgeDecision,
-          result.judgeExplanation,
-          result.output,
-          result.finishedAt,
-          result.finishedAt
-        );
-
-      this.db
-        .prepare(
-          `UPDATE tasks SET
-             status = ?,
-             attempt_count = ?,
-             lease_owner = NULL,
-             lease_expires_at = NULL,
-             last_error = ?,
-             updated_at = ?
+          `UPDATE tasks
+           SET status = ?,
+               attempt_count = ?,
+               lease_owner = NULL,
+               lease_expires_at = NULL,
+               last_error = ?,
+               updated_at = ?
            WHERE id = ?`
         )
-        .run(nextStatus, newAttemptCount, result.errorMessage, result.finishedAt, taskId);
+        .run(nextStatus, attemptNo, result.errorMessage, result.finishedAt, taskId);
 
-      this.createArtifact({
+      this.appendEvent({
         taskId,
-        kind: 'text',
-        bodyOrUri: result.output,
-        meta: {
+        attemptId: attempt?.id ?? null,
+        phase: result.finalPhase,
+        level: result.succeeded ? 'info' : 'error',
+        message: result.succeeded ? 'Task completed' : 'Task failed',
+        data: {
           worker_id: workerId,
-          attempt_no: attemptNo,
           worker_exit_code: result.workerExitCode,
-          judge_decision: result.judgeDecision,
-          judge_explanation: result.judgeExplanation,
-          succeeded: result.succeeded
+          next_status: nextStatus
         }
       });
-
-      const parsedSteps = this.extractStepsFromOutput(result.output);
-      for (const step of parsedSteps) {
-        this.upsertTaskStep(taskId, {
-          stepKey: step.stepKey,
-          status: step.status,
-          idempotencyKey: step.idempotencyKey,
-          result: { note: step.note ?? null, source: 'output_marker' }
-        });
-      }
-
-      this.appendEvent(result.succeeded ? 'task_completed' : 'task_failed', {
-        worker_id: workerId,
-        attempt_no: attemptNo,
-        error_message: result.errorMessage,
-        next_status: nextStatus,
-        parsed_steps: parsedSteps.length
-      }, taskId);
-
-      if (task.parent_task_id) {
-        this.reconcileParentAfterChildCompletion(task.parent_task_id);
-      }
     });
 
     tx();
   }
 
-  appendEvent(kind: string, data: Record<string, unknown>, taskId?: string | null): void {
-    const now = nowIso();
+  updateAttemptProgress(attemptId: number, phase: string, outputJson: Record<string, unknown>): void {
     this.db
-      .prepare(`INSERT INTO events (task_id, kind, data_json, created_at) VALUES (?, ?, ?, ?)`)
-      .run(taskId ?? null, kind, JSON.stringify(data), now);
+      .prepare('UPDATE task_attempts SET phase = ?, output_json = ? WHERE id = ?')
+      .run(phase, JSON.stringify(outputJson), attemptId);
   }
 
-  listEvents(limit = 50): EventRow[] {
+  appendEvent(input: {
+    taskId?: string | null;
+    attemptId?: number | null;
+    phase: string;
+    level: 'info' | 'warn' | 'error';
+    message: string;
+    data?: Record<string, unknown>;
+  }): void {
+    const now = nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO events (task_id, attempt_id, phase, level, message, data_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.taskId ?? null,
+        input.attemptId ?? null,
+        input.phase,
+        input.level,
+        input.message,
+        JSON.stringify(input.data ?? {}),
+        now
+      );
+  }
+
+  listEvents(limit = 50, taskId?: string): EventRow[] {
     const safeLimit = Math.max(1, Math.min(500, limit));
+    if (taskId) {
+      return this.db
+        .prepare('SELECT * FROM events WHERE task_id = ? ORDER BY created_at DESC LIMIT ?')
+        .all(taskId, safeLimit) as EventRow[];
+    }
+
     return this.db
       .prepare('SELECT * FROM events ORDER BY created_at DESC LIMIT ?')
       .all(safeLimit) as EventRow[];
@@ -430,7 +363,7 @@ export class QueueRepository {
     const now = nowIso();
     this.db
       .prepare(
-        `INSERT INTO state (key, value_json, updated_at)
+        `INSERT INTO run_state (key, value_json, updated_at)
          VALUES (?, ?, ?)
          ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at`
       )
@@ -438,307 +371,7 @@ export class QueueRepository {
   }
 
   getState(key: string): StateRow | null {
-    const row = this.db.prepare('SELECT * FROM state WHERE key = ?').get(key) as StateRow | undefined;
+    const row = this.db.prepare('SELECT * FROM run_state WHERE key = ?').get(key) as StateRow | undefined;
     return row ?? null;
-  }
-
-  listResponsibilities(): ResponsibilityRow[] {
-    return this.db
-      .prepare('SELECT * FROM responsibilities ORDER BY id ASC')
-      .all() as ResponsibilityRow[];
-  }
-
-  upsertCompiledResponsibility(input: {
-    id: string;
-    enabled?: boolean;
-    priority?: number;
-    compiled: CompiledResponsibility;
-  }): ResponsibilityRow {
-    const now = nowIso();
-    const enabled = input.enabled ?? true;
-    const priority = Number.isInteger(input.priority) ? Math.max(1, Math.min(5, input.priority!)) : 3;
-
-    this.db
-      .prepare(
-        `INSERT INTO responsibilities (
-          id, description, enabled, every_ms, source_kind, cursor_key, dedupe_template,
-          user_prompt, compile_version, contract_json, task_type, task_title, task_prompt,
-          task_success_criteria, dedupe_key, priority, last_run_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          description=excluded.description,
-          enabled=excluded.enabled,
-          every_ms=excluded.every_ms,
-          source_kind=excluded.source_kind,
-          cursor_key=excluded.cursor_key,
-          dedupe_template=excluded.dedupe_template,
-          user_prompt=excluded.user_prompt,
-          compile_version=excluded.compile_version,
-          contract_json=excluded.contract_json,
-          task_type=excluded.task_type,
-          task_title=excluded.task_title,
-          task_prompt=excluded.task_prompt,
-          dedupe_key=excluded.dedupe_key,
-          priority=excluded.priority,
-          updated_at=excluded.updated_at`
-      )
-      .run(
-        input.id,
-        input.compiled.description,
-        enabled ? 1 : 0,
-        input.compiled.everyMs,
-        input.compiled.sourceKind,
-        input.compiled.cursorKey,
-        input.compiled.dedupeTemplate,
-        (input.compiled.contract.user_prompt as string) ?? null,
-        1,
-        JSON.stringify(input.compiled.contract),
-        input.compiled.taskType,
-        input.compiled.taskTitle,
-        input.compiled.taskPrompt,
-        `responsibility:${input.id}:scan`,
-        priority,
-        now,
-        now
-      );
-
-    const row = this.db
-      .prepare('SELECT * FROM responsibilities WHERE id = ?')
-      .get(input.id) as ResponsibilityRow | undefined;
-    if (!row) {
-      throw new Error('Failed to upsert responsibility');
-    }
-
-    this.appendEvent('responsibility_compiled', {
-      responsibility_id: input.id,
-      source_kind: input.compiled.sourceKind,
-      cadence_ms: input.compiled.everyMs
-    });
-    return row;
-  }
-
-  listChildTasks(parentTaskId: string): TaskRow[] {
-    return this.db
-      .prepare('SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY created_at ASC')
-      .all(parentTaskId) as TaskRow[];
-  }
-
-  runDueResponsibilities(defaultMaxAttempts: number): { considered: number; created: number } {
-    const tx = this.db.transaction(() => {
-      const now = new Date();
-      const nowIsoValue = now.toISOString();
-      const responsibilities = this.listResponsibilities().filter((r) => {
-        if (r.enabled !== 1) {
-          return false;
-        }
-        if (!r.last_run_at) {
-          return true;
-        }
-        const lastRunAt = new Date(r.last_run_at).getTime();
-        return Number.isFinite(lastRunAt) && now.getTime() - lastRunAt >= r.every_ms;
-      });
-
-      let created = 0;
-      for (const responsibility of responsibilities) {
-        const dedupeKey = responsibility.dedupe_key;
-        if (dedupeKey) {
-          const existing = this.db
-            .prepare(
-              `SELECT id FROM tasks
-               WHERE dedupe_key = ?
-                 AND status IN ('queued', 'leased', 'running', 'waiting_children', 'blocked')
-               LIMIT 1`
-            )
-            .get(dedupeKey) as { id: string } | undefined;
-          if (existing) {
-            this.appendEvent('responsibility_skipped_duplicate', {
-              responsibility_id: responsibility.id,
-              dedupe_key: dedupeKey,
-              existing_task_id: existing.id
-            });
-
-            this.db
-              .prepare('UPDATE responsibilities SET last_run_at = ?, updated_at = ? WHERE id = ?')
-              .run(nowIsoValue, nowIsoValue, responsibility.id);
-            continue;
-          }
-        }
-
-        const task = this.createTask(
-          {
-            type: responsibility.task_type,
-            title: responsibility.task_title,
-            prompt: responsibility.task_prompt,
-            successCriteria: responsibility.task_success_criteria ?? undefined,
-            payload: { responsibility_id: responsibility.id },
-            priority: responsibility.priority,
-            dedupeKey: responsibility.dedupe_key ?? undefined
-          },
-          defaultMaxAttempts
-        );
-
-        this.appendEvent('responsibility_dispatched_task', {
-          responsibility_id: responsibility.id
-        }, task.id);
-
-        this.db
-          .prepare('UPDATE responsibilities SET last_run_at = ?, updated_at = ? WHERE id = ?')
-          .run(nowIsoValue, nowIsoValue, responsibility.id);
-
-        created += 1;
-      }
-
-      this.setState('responsibilities.last_tick', {
-        at: nowIsoValue,
-        considered: responsibilities.length,
-        created
-      });
-
-      return { considered: responsibilities.length, created };
-    });
-
-    return tx();
-  }
-
-  upsertTaskStep(taskId: string, input: UpsertTaskStepInput): TaskStepRow {
-    const now = nowIso();
-    this.db
-      .prepare(
-        `INSERT INTO task_steps (
-          task_id, step_key, status, idempotency_key, result_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(task_id, step_key) DO UPDATE SET
-          status=excluded.status,
-          idempotency_key=excluded.idempotency_key,
-          result_json=excluded.result_json,
-          updated_at=excluded.updated_at`
-      )
-      .run(
-        taskId,
-        input.stepKey,
-        input.status,
-        input.idempotencyKey ?? null,
-        JSON.stringify(input.result ?? {}),
-        now
-      );
-
-    return this.db
-      .prepare('SELECT * FROM task_steps WHERE task_id = ? AND step_key = ?')
-      .get(taskId, input.stepKey) as TaskStepRow;
-  }
-
-  listTaskSteps(taskId: string): TaskStepRow[] {
-    return this.db
-      .prepare('SELECT * FROM task_steps WHERE task_id = ? ORDER BY id ASC')
-      .all(taskId) as TaskStepRow[];
-  }
-
-  createArtifact(input: CreateArtifactInput): ArtifactRow {
-    const now = nowIso();
-    this.db
-      .prepare(
-        `INSERT INTO artifacts (task_id, kind, body_or_uri, meta_json, created_at)
-         VALUES (?, ?, ?, ?, ?)`
-      )
-      .run(
-        input.taskId ?? null,
-        input.kind,
-        input.bodyOrUri,
-        JSON.stringify(input.meta ?? {}),
-        now
-      );
-
-    const row = this.db
-      .prepare('SELECT * FROM artifacts WHERE rowid = last_insert_rowid()')
-      .get() as ArtifactRow | undefined;
-    if (!row) {
-      throw new Error('Failed to create artifact row');
-    }
-    return row;
-  }
-
-  listArtifacts(limit = 50, taskId?: string): ArtifactRow[] {
-    const safeLimit = Math.max(1, Math.min(500, limit));
-    if (taskId) {
-      return this.db
-        .prepare('SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at DESC LIMIT ?')
-        .all(taskId, safeLimit) as ArtifactRow[];
-    }
-
-    return this.db
-      .prepare('SELECT * FROM artifacts ORDER BY created_at DESC LIMIT ?')
-      .all(safeLimit) as ArtifactRow[];
-  }
-
-  private extractStepsFromOutput(output: string): Array<{
-    stepKey: string;
-    status: 'done' | 'failed';
-    idempotencyKey?: string | null;
-    note?: string | null;
-  }> {
-    const steps: Array<{
-      stepKey: string;
-      status: 'done' | 'failed';
-      idempotencyKey?: string | null;
-      note?: string | null;
-    }> = [];
-
-    // Marker format: STEP[<key>]: DONE|FAILED [idempotency=<token>] [note=<text>]
-    const regex = /^STEP\[(.+?)\]:\s*(DONE|FAILED)(?:\s+idempotency=([^\s]+))?(?:\s+note=(.+))?$/gim;
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(output)) !== null) {
-      steps.push({
-        stepKey: match[1].trim(),
-        status: match[2].toUpperCase() === 'DONE' ? 'done' : 'failed',
-        idempotencyKey: match[3]?.trim() ?? null,
-        note: match[4]?.trim() ?? null
-      });
-    }
-
-    return steps;
-  }
-
-  private countTaskDepth(taskId: string): number {
-    let depth = 0;
-    let currentId: string | null = taskId;
-    while (currentId) {
-      const row = this.db
-        .prepare('SELECT parent_task_id FROM tasks WHERE id = ?')
-        .get(currentId) as { parent_task_id: string | null } | undefined;
-      if (!row || !row.parent_task_id) {
-        break;
-      }
-      depth += 1;
-      currentId = row.parent_task_id;
-    }
-    return depth;
-  }
-
-  private reconcileParentAfterChildCompletion(parentTaskId: string): void {
-    const children = this.listChildTasks(parentTaskId);
-    if (children.length === 0) {
-      return;
-    }
-
-    const hasActive = children.some((c) => c.status === 'queued' || c.status === 'leased' || c.status === 'running' || c.status === 'waiting_children');
-    if (hasActive) {
-      return;
-    }
-
-    const hasFailure = children.some((c) => c.status === 'failed' || c.status === 'blocked');
-    const now = nowIso();
-    const nextStatus: TaskStatus = hasFailure ? 'blocked' : 'queued';
-    this.db
-      .prepare(
-        `UPDATE tasks
-         SET status = ?, updated_at = ?
-         WHERE id = ? AND status = 'waiting_children'`
-      )
-      .run(nextStatus, now, parentTaskId);
-
-    this.appendEvent('parent_task_resolved_children', {
-      next_status: nextStatus,
-      child_count: children.length
-    }, parentTaskId);
   }
 }
