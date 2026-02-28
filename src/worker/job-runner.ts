@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TaskRow } from '../queue/types.js';
@@ -261,6 +261,7 @@ function buildProviderCommand(
     if (schema) {
       args.push('--json-schema', schema.schemaJson);
     }
+    console.log('[job-runner] provider=claude args=', args);
     return {
       command: 'claude',
       args,
@@ -273,6 +274,7 @@ function buildProviderCommand(
     args.push('--output-schema', schema.schemaPath);
   }
   args.push(prompt);
+  console.log('[job-runner] provider=codex args=', args);
   return {
     command: 'codex',
     args,
@@ -421,6 +423,36 @@ function computeIdempotencyKey(task: TaskRow, interpret: Record<string, unknown>
   return createHash('sha256').update(canonical).digest('hex');
 }
 
+function resolveExecuteSchemaOverride(
+  runDir: string,
+  plan: Record<string, unknown>
+): { schemaJson: string; schemaPath: string } | null {
+  const strict = plan.execute_output_strict === true;
+  const formatRaw = plan.execute_output_format;
+  const format = typeof formatRaw === 'string' ? formatRaw.toLowerCase() : '';
+  if (!strict || format !== 'json') {
+    return null;
+  }
+
+  let schemaCandidate = plan.execute_output_schema;
+  if (typeof schemaCandidate === 'string') {
+    try {
+      schemaCandidate = JSON.parse(schemaCandidate);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!schemaCandidate || typeof schemaCandidate !== 'object' || Array.isArray(schemaCandidate)) {
+    return null;
+  }
+
+  const schemaPath = resolve(runDir, 'execute.output.schema.json');
+  const schemaJson = JSON.stringify(schemaCandidate);
+  writeFileSync(schemaPath, JSON.stringify(schemaCandidate, null, 2), 'utf8');
+  return { schemaJson, schemaPath };
+}
+
 async function runPhase(
   provider: 'codex' | 'claude',
   runDir: string,
@@ -428,12 +460,13 @@ async function runPhase(
   runLabel: string,
   phaseName: string,
   phasePrompt: string,
-  phaseTimeoutMs: number
+  phaseTimeoutMs: number,
+  schemaOverride: { schemaJson: string; schemaPath: string } | null = null
 ): Promise<Record<string, unknown>> {
   if (streamJobLogs) {
     console.log(`[run/${runLabel}][${phaseName}] start`);
   }
-  const schema = readPhaseSchema(phaseName);
+  const schema = schemaOverride ?? readPhaseSchema(phaseName);
   const cmd = buildProviderCommand(provider, phasePrompt, schema);
   const result = await runCommand(cmd.command, cmd.args, runDir, cmd.stdin, phaseTimeoutMs);
   if (result.spawnError) {
@@ -754,6 +787,13 @@ export async function runLeasedJob(
       buildPhasePrompt(basePrompt, policyPrompt, { task, interpret, plan }),
       phaseTimeoutMs
     );
+    const executeSchemaOverride = resolveExecuteSchemaOverride(runDir, plan);
+    if (executeSchemaOverride) {
+      await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execute schema enforced from plan', {
+        execute_output_format: plan.execute_output_format ?? 'json',
+        execute_output_strict: true
+      });
+    }
 
     const idempotencyKey = computeIdempotencyKey(task, interpret, executionPolicy);
     const stateKey = `idempotency:${idempotencyKey}`;
@@ -830,7 +870,8 @@ export async function runLeasedJob(
         ].join('\n'),
         { task, interpret, plan, execution_policy: executionPolicy }
       ),
-      phaseTimeoutMs
+      phaseTimeoutMs,
+      executeSchemaOverride
     );
     await executeStreamer.emitToolResult({
       action_id: executeActionId,

@@ -23,6 +23,16 @@
     "artifacts_expected": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "execute_output_format": {
+      "type": "string",
+      "enum": ["json", "markdown"]
+    },
+    "execute_output_strict": {
+      "type": "boolean"
+    },
+    "execute_output_schema": {
+      "type": "object"
     }
   },
   "required": ["steps"],
