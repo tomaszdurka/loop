@@ -76,6 +76,19 @@ npm run loop -- events:tail --limit 50
 - `GET /state/:key`
 - `POST /state/:key`
 
+## Streaming Run-Wait (NDJSON)
+
+`POST /tasks/run-wait` streams NDJSON envelopes event-by-event.
+
+Example with `jq` parsing each line (`fromjson`) and showing multiline indented output:
+
+```bash
+curl -sS -N -X POST http://localhost:7070/tasks/run-wait \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"what are the figurines in 17th minifigurines lego series","mode":"lean"}' \
+| jq -RC --unbuffered 'fromjson? | select(.)'
+```
+
 `POST /tasks` accepts optional `mode`:
 - `auto` (default): tiny classifier decides `lean` or `full`
 - `lean`: execute -> verify -> report

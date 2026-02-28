@@ -4,6 +4,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TaskRow } from '../queue/types.js';
+import { RunStreamer, type StreamEnvelope } from './execute-runner.js';
 
 export type WorkerRuntimeOptions = {
   streamJobLogs: boolean;
@@ -139,6 +140,29 @@ async function pushEvent(
     level,
     message,
     data: data ?? {}
+  });
+}
+
+async function pushEnvelope(
+  baseUrl: string,
+  taskId: string,
+  workerId: string,
+  attemptId: number | null,
+  envelope: StreamEnvelope
+): Promise<void> {
+  const level = envelope.type === 'error'
+    ? 'error'
+    : envelope.type === 'event' && envelope.payload.level === 'warn'
+      ? 'warn'
+      : 'info';
+
+  await postJson(baseUrl, `/tasks/${encodeURIComponent(taskId)}/events`, {
+    worker_id: workerId,
+    attempt_id: attemptId,
+    phase: envelope.phase,
+    level,
+    message: envelope.type,
+    data: { envelope }
   });
 }
 
@@ -352,9 +376,12 @@ export async function runLeasedJob(
   attemptId: number | null,
   options: WorkerRuntimeOptions
 ): Promise<boolean> {
-  const runId = `${task.id}-${Date.now()}-${randomUUID().slice(0, 8)}`;
-  const runLabel = runId.split('-').pop() ?? runId;
+  const runId = `run_${Date.now().toString(36)}${randomUUID().replace(/-/g, '').slice(0, 6)}`;
+  const runLabel = runId.slice(4);
   const runDir = createRunDir(runId);
+  const executeStreamer = new RunStreamer(runId, 'execute', async (envelope) => {
+    await pushEnvelope(baseUrl, task.id, workerId, attemptId, envelope);
+  });
 
   const heartbeatTimer = setInterval(() => {
     heartbeat(baseUrl, workerId, task.id, leaseTtlMs).catch((error) => {
@@ -405,7 +432,24 @@ export async function runLeasedJob(
     });
 
     if (effectiveMode === 'lean') {
+      await executeStreamer.emitStateChange({ from: 'pending', to: 'running' });
+      await executeStreamer.emitEvent({
+        level: 'info',
+        message: 'Execute loop started',
+        data: { mode: 'lean' }
+      });
+
       await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started');
+      const executeActionId = `a_${randomUUID().slice(0, 8)}`;
+      const executeIdempotencyKey = `ik:${task.id}:execute:${executeActionId}`;
+      await executeStreamer.emitAction({
+        action_id: executeActionId,
+        step_id: 'S_EXEC',
+        tool: 'llm_execute',
+        arguments: { prompt: task.prompt },
+        idempotency_key: executeIdempotencyKey
+      });
+
       const execute = await runPhase(
         options.provider,
         runDir,
@@ -432,6 +476,19 @@ export async function runLeasedJob(
           { task, mode: effectiveMode }
         )
       );
+      await executeStreamer.emitToolResult({
+        action_id: executeActionId,
+        step_id: 'S_EXEC',
+        tool: 'llm_execute',
+        ok: execute.status === 'succeeded',
+        result: execute,
+        truncated: false
+      });
+      await executeStreamer.emitArtifact({
+        name: 'result',
+        format: 'json',
+        content: execute
+      }, 'system');
 
       let verify: Record<string, unknown>;
       if (task.success_criteria && task.success_criteria.trim().length > 0) {
@@ -488,6 +545,7 @@ export async function runLeasedJob(
         error_message: pass ? null : 'Verification failed',
         finished_at: new Date().toISOString()
       });
+      await executeStreamer.emitStateChange({ from: 'running', to: pass ? 'succeeded' : 'failed' });
       return pass;
     }
 
@@ -595,6 +653,22 @@ export async function runLeasedJob(
     }
 
     await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started');
+    await executeStreamer.emitStateChange({ from: 'pending', to: 'running' });
+    await executeStreamer.emitEvent({
+      level: 'info',
+      message: 'Execute loop started',
+      data: { mode: 'full' }
+    });
+    const executeActionId = `a_${randomUUID().slice(0, 8)}`;
+    const executeIdempotencyKey = `ik:${task.id}:execute:${executeActionId}`;
+    await executeStreamer.emitAction({
+      action_id: executeActionId,
+      step_id: 'S_EXEC',
+      tool: 'llm_execute',
+      arguments: { prompt: task.prompt },
+      idempotency_key: executeIdempotencyKey
+    });
+
     const execute = await runPhase(
       options.provider,
       runDir,
@@ -621,6 +695,19 @@ export async function runLeasedJob(
         { task, interpret, plan, execution_policy: executionPolicy }
       )
     );
+    await executeStreamer.emitToolResult({
+      action_id: executeActionId,
+      step_id: 'S_EXEC',
+      tool: 'llm_execute',
+      ok: execute.status === 'succeeded',
+      result: execute,
+      truncated: false
+    });
+    await executeStreamer.emitArtifact({
+      name: 'result',
+      format: 'json',
+      content: execute
+    }, 'system');
 
     await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification started');
     const verify = await runPhase(
@@ -684,6 +771,7 @@ export async function runLeasedJob(
       error_message: pass ? null : 'Verification failed',
       finished_at: new Date().toISOString()
     });
+    await executeStreamer.emitStateChange({ from: 'running', to: pass ? 'succeeded' : 'failed' });
 
     return pass;
   } catch (error) {
@@ -699,6 +787,11 @@ export async function runLeasedJob(
       error_message: message,
       finished_at: new Date().toISOString()
     });
+    await executeStreamer.emitError({
+      code: 'EXECUTE_RUNTIME_ERROR',
+      message
+    });
+    await executeStreamer.emitStateChange({ from: 'running', to: 'failed' });
     return false;
   } finally {
     clearInterval(heartbeatTimer);

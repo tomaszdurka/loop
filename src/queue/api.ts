@@ -192,13 +192,65 @@ export function startQueueApi(): void {
 
         const task = repo.createTask({ prompt, successCriteria, type, title, priority, metadata, mode }, config.maxAttempts);
         const deadline = Date.now() + RUN_WAIT_TIMEOUT_MS;
+        let lastEventId = 0;
+        let lastSequence = 0;
+        let runIdForStream: string | null = null;
+
+        res.writeHead(200, {
+          'Content-Type': 'application/x-ndjson; charset=utf-8',
+          'Transfer-Encoding': 'chunked',
+          'Cache-Control': 'no-cache'
+        });
+
+        const writeNdjson = (obj: unknown): void => {
+          res.write(`${JSON.stringify(obj)}\n`);
+        };
 
         let latest = repo.getTaskById(task.id) ?? task;
         while (!isTerminalStatus(latest.status) && Date.now() < deadline) {
+          const eventsAsc = repo
+            .listEvents(500, task.id)
+            .slice()
+            .sort((a, b) => a.id - b.id);
+
+          for (const event of eventsAsc) {
+            if (event.id <= lastEventId) {
+              continue;
+            }
+            lastEventId = event.id;
+            try {
+              const data = JSON.parse(event.data_json) as { envelope?: unknown };
+              if (data.envelope && typeof data.envelope === 'object') {
+                const envelope = data.envelope as Record<string, unknown>;
+                const seq = envelope.sequence;
+                const runId = envelope.run_id;
+                if (typeof runId === 'string' && runId.length > 0) {
+                  runIdForStream = runId;
+                }
+                if (typeof seq === 'number' && Number.isInteger(seq) && seq > lastSequence) {
+                  lastSequence = seq;
+                }
+                writeNdjson(envelope);
+              }
+            } catch {
+              // ignore malformed event payload rows
+            }
+          }
+
           await sleep(RUN_WAIT_POLL_MS);
           const refreshed = repo.getTaskById(task.id);
           if (!refreshed) {
-            sendJson(res, 500, { error: 'task disappeared during wait', task_id: task.id });
+            writeNdjson({
+              run_id: task.id,
+              sequence: lastSequence + 1,
+              timestamp: new Date().toISOString(),
+              type: 'error',
+              phase: 'execute',
+              producer: 'system',
+              payload: { code: 'TASK_DISAPPEARED', message: 'task disappeared during wait' }
+            });
+            lastSequence += 1;
+            res.end();
             return;
           }
           latest = refreshed;
@@ -215,17 +267,63 @@ export function startQueueApi(): void {
           }
         }
         if (!isTerminalStatus(latest.status)) {
-          sendJson(res, 504, {
-            error: 'run_wait_timeout',
-            task_id: latest.id,
-            status: latest.status
+          writeNdjson({
+            run_id: task.id,
+            sequence: lastSequence + 1,
+            timestamp: new Date().toISOString(),
+            type: 'error',
+            phase: 'execute',
+            producer: 'system',
+            payload: { code: 'RUN_WAIT_TIMEOUT', message: 'run wait timeout reached' }
           });
+          lastSequence += 1;
+          res.end();
           return;
         }
 
-        sendJson(res, 200, {
-          output: extractUserOutput(output)
+        const eventsAsc = repo
+          .listEvents(500, task.id)
+          .slice()
+          .sort((a, b) => a.id - b.id);
+        for (const event of eventsAsc) {
+          if (event.id <= lastEventId) {
+            continue;
+          }
+          lastEventId = event.id;
+          try {
+            const data = JSON.parse(event.data_json) as { envelope?: unknown };
+            if (data.envelope && typeof data.envelope === 'object') {
+              const envelope = data.envelope as Record<string, unknown>;
+              const seq = envelope.sequence;
+              const runId = envelope.run_id;
+              if (typeof runId === 'string' && runId.length > 0) {
+                runIdForStream = runId;
+              }
+              if (typeof seq === 'number' && Number.isInteger(seq) && seq > lastSequence) {
+                lastSequence = seq;
+              }
+              writeNdjson(envelope);
+            }
+          } catch {
+            // ignore malformed event payload rows
+          }
+        }
+
+        writeNdjson({
+          run_id: runIdForStream ?? task.id,
+          sequence: lastSequence + 1,
+          timestamp: new Date().toISOString(),
+          type: 'artifact',
+          phase: 'execute',
+          producer: 'system',
+          payload: {
+            name: 'final_output',
+            format: 'markdown',
+            content: extractUserOutput(output)
+          }
         });
+        lastSequence += 1;
+        res.end();
         return;
       }
 

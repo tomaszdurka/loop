@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { loadWorkerConfig } from './config.js';
 import { leaseNextJob, runLeasedJob, type WorkerRuntimeOptions } from './job-runner.js';
 
@@ -6,9 +5,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function generateWorkerId(): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const timePart = Date.now().toString(36).slice(-4).padStart(4, '0');
+  let randomPart = '';
+  for (let i = 0; i < 4; i += 1) {
+    randomPart += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return `${timePart}${randomPart}`;
+}
+
 export async function startQueueWorker(options: WorkerRuntimeOptions): Promise<void> {
   const config = loadWorkerConfig();
-  const workerId = `worker-${randomUUID()}`;
+  const workerId = generateWorkerId();
 
   console.log('[queue-worker] started');
   console.log(`[queue-worker] worker_id: ${workerId}`);
