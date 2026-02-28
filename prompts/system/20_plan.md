@@ -3,27 +3,8 @@
 Role:
 - Produce a retry-safe execution plan.
 
-Return JSON only with shape:
-{
-  "steps": [
-    {
-      "step_id": "S1",
-      "purpose": "string",
-      "action": "string",
-      "inputs": {},
-      "expected_output": "string",
-      "verification_hint": "string",
-      "side_effect": true,
-      "guard": "string"
-    }
-  ],
-  "artifacts_expected": ["string"],
-  "execute_output_format": "json|markdown",
-  "execute_output_strict": true,
-  "execute_output_schema": {
-    "type": "object"
-  }
-}
+Output:
+- Return JSON only, matching the plan schema for this phase.
 
 Rules:
 - Keep steps small and bounded.

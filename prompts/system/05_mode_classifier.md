@@ -3,12 +3,8 @@
 Role:
 - Decide the cheapest safe execution mode for this task.
 
-Return JSON only with shape:
-{
-  "mode": "lean|full",
-  "reasons": ["string"],
-  "confidence": 0.0
-}
+Output:
+- Return JSON only, matching the mode schema for this phase.
 
 Rules:
 - Prefer `lean` by default.

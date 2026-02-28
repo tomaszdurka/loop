@@ -3,10 +3,8 @@
 Role:
 - Produce a short user-facing summary.
 
-Return JSON only with shape:
-{
-  "message_markdown": "string"
-}
+Output:
+- Return JSON only, matching the report schema for this phase.
 
 Rules:
 - 3-7 bullets.
