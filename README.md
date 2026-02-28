@@ -47,15 +47,28 @@ npm run loop -- gateway
 npm run loop -- worker --provider claude --stream-job-logs
 ```
 
-4. Create task:
+4. Queue task (`run -> queue`, returns task id):
 
 ```bash
-curl -sS -X POST http://localhost:7070/tasks \
+curl -sS -X POST http://localhost:7070/run \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Build a landing page for dog lovers","success_criteria":"A landing page file exists and is wired into project","mode":"auto"}'
+  -d '{"prompt":"Build a landing page for dog lovers","success_criteria":"A landing page file exists and is wired into project","mode":"auto"}' \
+| jq
 ```
 
-5. Inspect:
+5. Run and wait with NDJSON stream (`run-wait -> run`):
+
+```bash
+curl -sS -N -X POST http://localhost:7070/run-wait \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt":"what are the figurines in 17th minifigurines lego series",
+    "mode":"lean"
+  }' \
+| jq -RC --unbuffered 'fromjson? | select(.) | {type, phase, payload}'
+```
+
+6. Inspect:
 
 ```bash
 npm run loop -- status
@@ -65,9 +78,12 @@ npm run loop -- events:tail --limit 50
 
 ## REST API
 
-- `POST /tasks`
+- `POST /run` (queue task, returns `task_id`)
+- `POST /run-wait` (run and stream NDJSON envelopes)
 - `GET /tasks`
 - `GET /tasks/:id`
+- `GET /tasks/:id/attempts`
+- `GET /tasks/:id/events?limit=<n>`
 - `POST /tasks/lease`
 - `POST /tasks/:id/heartbeat`
 - `POST /tasks/:id/events`
@@ -76,20 +92,7 @@ npm run loop -- events:tail --limit 50
 - `GET /state/:key`
 - `POST /state/:key`
 
-## Streaming Run-Wait (NDJSON)
-
-`POST /tasks/run-wait` streams NDJSON envelopes event-by-event.
-
-Example with `jq` parsing each line (`fromjson`) and showing multiline indented output:
-
-```bash
-curl -sS -N -X POST http://localhost:7070/tasks/run-wait \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"what are the figurines in 17th minifigurines lego series","mode":"lean"}' \
-| jq -RC --unbuffered 'fromjson? | select(.)'
-```
-
-`POST /tasks` accepts optional `mode`:
+`POST /run` and `POST /run-wait` accept optional `mode`:
 - `auto` (default): tiny classifier decides `lean` or `full`
 - `lean`: execute -> verify -> report
 - `full`: interpret -> plan -> policy -> execute -> verify -> report
