@@ -205,6 +205,62 @@ export function startQueueApi(): void {
         const writeNdjson = (obj: unknown): void => {
           res.write(`${JSON.stringify(obj)}\n`);
         };
+        const streamEventRow = (event: {
+          phase: string;
+          level: string;
+          message: string;
+          data_json: string;
+          created_at: string;
+        }): void => {
+          try {
+            const data = JSON.parse(event.data_json) as { envelope?: unknown };
+            if (data.envelope && typeof data.envelope === 'object') {
+              const envelope = data.envelope as Record<string, unknown>;
+              const seq = envelope.sequence;
+              const runId = envelope.run_id;
+              if (typeof runId === 'string' && runId.length > 0) {
+                runIdForStream = runId;
+              }
+              if (typeof seq === 'number' && Number.isInteger(seq) && seq > lastSequence) {
+                lastSequence = seq;
+              }
+              writeNdjson(envelope);
+              return;
+            }
+
+            // For non-envelope records (interpret/plan/policy/verify/report, etc.),
+            // emit a normalized NDJSON event so full-mode progress is visible live.
+            lastSequence += 1;
+            writeNdjson({
+              run_id: runIdForStream ?? task.id,
+              sequence: lastSequence,
+              timestamp: event.created_at,
+              type: 'event',
+              phase: event.phase,
+              producer: 'system',
+              payload: {
+                level: event.level,
+                message: event.message,
+                data
+              }
+            });
+          } catch {
+            lastSequence += 1;
+            writeNdjson({
+              run_id: runIdForStream ?? task.id,
+              sequence: lastSequence,
+              timestamp: event.created_at,
+              type: 'event',
+              phase: event.phase,
+              producer: 'system',
+              payload: {
+                level: event.level,
+                message: event.message,
+                data: {}
+              }
+            });
+          }
+        };
 
         writeNdjson({
           run_id: task.id,
@@ -232,23 +288,7 @@ export function startQueueApi(): void {
               continue;
             }
             lastEventId = event.id;
-            try {
-              const data = JSON.parse(event.data_json) as { envelope?: unknown };
-              if (data.envelope && typeof data.envelope === 'object') {
-                const envelope = data.envelope as Record<string, unknown>;
-                const seq = envelope.sequence;
-                const runId = envelope.run_id;
-                if (typeof runId === 'string' && runId.length > 0) {
-                  runIdForStream = runId;
-                }
-                if (typeof seq === 'number' && Number.isInteger(seq) && seq > lastSequence) {
-                  lastSequence = seq;
-                }
-                writeNdjson(envelope);
-              }
-            } catch {
-              // ignore malformed event payload rows
-            }
+            streamEventRow(event);
           }
 
           await sleep(RUN_WAIT_POLL_MS);
@@ -304,23 +344,7 @@ export function startQueueApi(): void {
             continue;
           }
           lastEventId = event.id;
-          try {
-            const data = JSON.parse(event.data_json) as { envelope?: unknown };
-            if (data.envelope && typeof data.envelope === 'object') {
-              const envelope = data.envelope as Record<string, unknown>;
-              const seq = envelope.sequence;
-              const runId = envelope.run_id;
-              if (typeof runId === 'string' && runId.length > 0) {
-                runIdForStream = runId;
-              }
-              if (typeof seq === 'number' && Number.isInteger(seq) && seq > lastSequence) {
-                lastSequence = seq;
-              }
-              writeNdjson(envelope);
-            }
-          } catch {
-            // ignore malformed event payload rows
-          }
+          streamEventRow(event);
         }
 
         writeNdjson({
