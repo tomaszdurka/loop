@@ -121,7 +121,7 @@ export function startQueueApi(): void {
         return;
       }
 
-      if (method === 'POST' && (url.pathname === '/tasks' || url.pathname === '/run')) {
+      if (method === 'POST' && url.pathname === '/queue') {
         const body = await readJsonBody(req) as {
           prompt?: unknown;
           success_criteria?: unknown;
@@ -154,16 +154,11 @@ export function startQueueApi(): void {
           : 'auto';
 
         const task = repo.createTask({ prompt, successCriteria, type, title, priority, metadata, mode }, config.maxAttempts);
-        if (url.pathname === '/run') {
-          sendJson(res, 201, { task_id: task.id });
-          return;
-        }
-
-        sendJson(res, 201, { id: task.id, status: task.status, created_at: task.created_at });
+        sendJson(res, 201, { task_id: task.id });
         return;
       }
 
-      if (method === 'POST' && (url.pathname === '/tasks/run-wait' || url.pathname === '/run-wait')) {
+      if (method === 'POST' && url.pathname === '/run') {
         const body = await readJsonBody(req) as {
           prompt?: unknown;
           success_criteria?: unknown;
