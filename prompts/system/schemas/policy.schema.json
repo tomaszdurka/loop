@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "idempotency": {
+      "type": "object",
+      "properties": {
+        "key_fields": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "canonicalization": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "key_formula": { "type": "string" }
+      },
+      "required": ["key_fields"],
+      "additionalProperties": true
+    },
+    "dedupe": {
+      "type": "object",
+      "properties": {
+        "done_record": { "type": "string" },
+        "lookup_query": { "type": "string" },
+        "skip_if": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "retry": {
+      "type": "object",
+      "properties": {
+        "max_attempts": { "type": "integer" },
+        "backoff": { "type": "string" },
+        "retryable_errors": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "safety": {
+      "type": "object",
+      "properties": {
+        "requires_user_confirm": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "no_go_conditions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "required": ["idempotency"],
+  "additionalProperties": true
+}

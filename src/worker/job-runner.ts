@@ -225,18 +225,57 @@ function readSystemPromptFile(name: string): string {
   return readFileSync(filePath, 'utf8').trim();
 }
 
-function buildProviderCommand(provider: 'codex' | 'claude', prompt: string): { command: string; args: string[]; stdin: string | null } {
+function readPhaseSchema(phaseName: string): { schemaJson: string; schemaPath: string } | null {
+  const phaseSchemaFile: Record<string, string> = {
+    mode: 'mode.schema.json',
+    interpret: 'interpret.schema.json',
+    plan: 'plan.schema.json',
+    policy: 'policy.schema.json',
+    verify: 'verify.schema.json',
+    report: 'report.schema.json'
+  };
+  const fileName = phaseSchemaFile[phaseName];
+  if (!fileName) {
+    return null;
+  }
+
+  const schemaPath = resolve(SYSTEM_PROMPTS_DIR, 'schemas', fileName);
+  if (!existsSync(schemaPath)) {
+    throw new Error(`Missing schema file: ${schemaPath}`);
+  }
+  const raw = readFileSync(schemaPath, 'utf8');
+  const parsed = JSON.parse(raw) as unknown;
+  return {
+    schemaJson: JSON.stringify(parsed),
+    schemaPath
+  };
+}
+
+function buildProviderCommand(
+  provider: 'codex' | 'claude',
+  prompt: string,
+  schema: { schemaJson: string; schemaPath: string } | null
+): { command: string; args: string[]; stdin: string | null } {
   if (provider === 'claude') {
+    const args = ['--dangerously-skip-permissions', '--print', '--output-format', 'json'];
+    if (schema) {
+      args.push('--json-schema', schema.schemaJson);
+    }
     return {
       command: 'claude',
-      args: ['--dangerously-skip-permissions', '--print'],
+      args,
       stdin: prompt
     };
   }
 
+  const args = ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'];
+  if (schema) {
+    args.push('--output-schema', schema.schemaPath);
+  }
+  args.push(prompt);
   return {
     command: 'codex',
-    args: ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', prompt],
+    args,
     stdin: null
   };
 }
@@ -252,23 +291,85 @@ function buildPhasePrompt(base: string, phaseText: string, input: Record<string,
   ].join('\n');
 }
 
-function extractJsonObject(raw: string): Record<string, unknown> {
+function extractJsonFromText(raw: string): Record<string, unknown> {
   const fenced = raw.match(/```json\s*([\s\S]*?)```/i);
   const direct = fenced?.[1] ?? raw;
-
   const firstBrace = direct.indexOf('{');
   const lastBrace = direct.lastIndexOf('}');
   if (firstBrace < 0 || lastBrace <= firstBrace) {
     throw new Error('No JSON object found in model output');
   }
-
   const candidate = direct.slice(firstBrace, lastBrace + 1);
   const parsed = JSON.parse(candidate) as unknown;
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('Model output JSON is not an object');
   }
-
   return parsed as Record<string, unknown>;
+}
+
+function extractJsonObject(raw: string): Record<string, unknown> {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error('No JSON object found in model output');
+  }
+
+  // First try plain direct extraction (legacy behavior).
+  try {
+    return extractJsonFromText(trimmed);
+  } catch {
+    // continue with structured wrapper parsing
+  }
+
+  let parsedTop: unknown;
+  try {
+    parsedTop = JSON.parse(trimmed);
+  } catch {
+    throw new Error('No JSON object found in model output');
+  }
+
+  const unwrap = (value: unknown): Record<string, unknown> | null => {
+    if (!value) {
+      return null;
+    }
+    if (typeof value === 'object' && !Array.isArray(value)) {
+      const obj = value as Record<string, unknown>;
+      const candidateKeys = ['result', 'output', 'text', 'message', 'content'];
+      for (const key of candidateKeys) {
+        const candidate = obj[key];
+        if (typeof candidate === 'string') {
+          try {
+            return extractJsonFromText(candidate);
+          } catch {
+            // keep scanning wrappers
+          }
+        }
+        if (Array.isArray(candidate)) {
+          const textJoined = candidate
+            .map((entry) => (entry && typeof entry === 'object' && !Array.isArray(entry)
+              ? (entry as Record<string, unknown>).text
+              : ''))
+            .filter((x): x is string => typeof x === 'string' && x.length > 0)
+            .join('\n');
+          if (textJoined) {
+            try {
+              return extractJsonFromText(textJoined);
+            } catch {
+              // keep scanning wrappers
+            }
+          }
+        }
+      }
+      return obj;
+    }
+    return null;
+  };
+
+  const unwrapped = unwrap(parsedTop);
+  if (unwrapped) {
+    return unwrapped;
+  }
+
+  throw new Error('No JSON object found in model output');
 }
 
 function asStringArray(value: unknown): string[] {
@@ -332,7 +433,8 @@ async function runPhase(
   if (streamJobLogs) {
     console.log(`[run/${runLabel}][${phaseName}] start`);
   }
-  const cmd = buildProviderCommand(provider, phasePrompt);
+  const schema = readPhaseSchema(phaseName);
+  const cmd = buildProviderCommand(provider, phasePrompt, schema);
   const result = await runCommand(cmd.command, cmd.args, runDir, cmd.stdin, phaseTimeoutMs);
   if (result.spawnError) {
     if (streamJobLogs) {

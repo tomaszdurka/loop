@@ -107,6 +107,14 @@ npm run loop -- events:tail --limit 50
 - `prompts/system/40_verify.md`
 - `prompts/system/50_report.md`
 
+Structured output schemas (enforced for non-execute phases):
+- `prompts/system/schemas/mode.schema.json`
+- `prompts/system/schemas/interpret.schema.json`
+- `prompts/system/schemas/plan.schema.json`
+- `prompts/system/schemas/policy.schema.json`
+- `prompts/system/schemas/verify.schema.json`
+- `prompts/system/schemas/report.schema.json`
+
 ## Env Vars
 
 Gateway:

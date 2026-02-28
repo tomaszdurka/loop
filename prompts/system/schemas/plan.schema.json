@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "step_id": { "type": "string" },
+          "action": { "type": "string" },
+          "purpose": { "type": "string" },
+          "inputs": { "type": "object" },
+          "expected_output": { "type": "string" },
+          "verification_hint": { "type": "string" },
+          "side_effect": { "type": "boolean" },
+          "guard": { "type": "string" }
+        },
+        "required": ["step_id", "action", "purpose"],
+        "additionalProperties": true
+      }
+    },
+    "artifacts_expected": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["steps"],
+  "additionalProperties": true
+}
