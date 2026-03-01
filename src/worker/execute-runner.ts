@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-export type StreamType = 'state_change' | 'event' | 'action' | 'tool_result' | 'artifact' | 'error';
+export type StreamType = 'state_change' | 'event' | 'model_output' | 'action' | 'tool_result' | 'artifact' | 'error';
 export type StreamProducer = 'system' | 'model';
 
 export type StreamEnvelope = {
@@ -41,6 +41,10 @@ export class RunStreamer {
 
   emitEvent(payload: Record<string, unknown>): Promise<StreamEnvelope> {
     return this.emit('event', 'system', payload);
+  }
+
+  emitModelOutput(payload: Record<string, unknown>): Promise<StreamEnvelope> {
+    return this.emit('model_output', 'system', payload);
   }
 
   emitAction(payload: Record<string, unknown>): Promise<StreamEnvelope> {

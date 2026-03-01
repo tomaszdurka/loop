@@ -257,9 +257,11 @@ function buildProviderCommand(
   schema: { schemaJson: string; schemaPath: string } | null
 ): { command: string; args: string[]; stdin: string | null } {
   if (provider === 'claude') {
-    const args = ['--dangerously-skip-permissions', '--print', '--output-format', 'json'];
+    const args = ['--dangerously-skip-permissions', '--print'];
     if (schema) {
-      args.push('--json-schema', schema.schemaJson);
+      args.push( '--output-format', 'json', '--json-schema', schema.schemaJson);
+    } else {
+      args.push('--verbose', '--output-format', 'stream-json');
     }
     return {
       command: 'claude',
@@ -370,6 +372,36 @@ function extractJsonObject(raw: string): Record<string, unknown> {
   }
 
   throw new Error('No JSON object found in model output');
+}
+
+function parseStreamJsonLine(line: string): Record<string, unknown> | null {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function extractTerminalResultText(streamItem: Record<string, unknown>): string | null {
+  if (streamItem.type !== 'result') {
+    return null;
+  }
+  const result = streamItem.result;
+  if (typeof result === 'string') {
+    return result;
+  }
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    return JSON.stringify(result);
+  }
+  return null;
 }
 
 function asStringArray(value: unknown): string[] {
@@ -487,14 +519,38 @@ async function runPhase(
   phaseName: string,
   phasePrompt: string,
   phaseTimeoutMs: number,
-  schemaOverride: { schemaJson: string; schemaPath: string } | null = null
+  schemaOverride: { schemaJson: string; schemaPath: string } | null = null,
+  onOutput?: (output: string) => void
 ): Promise<Record<string, unknown>> {
   if (streamJobLogs) {
     console.log(`[run/${runLabel}][${phaseName}] start`);
   }
+
   const schema = schemaOverride ?? readPhaseSchema(phaseName);
   const cmd = buildProviderCommand(provider, phasePrompt, schema);
-  const result = await runCommand(cmd.command, cmd.args, runDir, cmd.stdin, phaseTimeoutMs);
+  const isExecuteStreamJson = provider === 'claude' && phaseName === 'execute' && !schema;
+  let terminalResultText: string | null = null;
+  const result = await runCommand(
+    cmd.command,
+    cmd.args,
+    runDir,
+    cmd.stdin,
+    phaseTimeoutMs,
+    (line) => {
+      onOutput?.(line);
+      if (!isExecuteStreamJson) {
+        return;
+      }
+      const item = parseStreamJsonLine(line);
+      if (!item) {
+        return;
+      }
+      const extracted = extractTerminalResultText(item);
+      if (typeof extracted === 'string' && extracted.length > 0) {
+        terminalResultText = extracted;
+      }
+    }
+  );
   if (result.spawnError) {
     if (streamJobLogs) {
       console.log(`[run/${runLabel}][${phaseName}] spawn_error=${result.spawnError}`);
@@ -508,7 +564,20 @@ async function runPhase(
     throw new Error(`${phaseName} failed with exit code ${result.exitCode}: ${result.stderr || result.stdout}`);
   }
 
-  const parsed = extractJsonObject(result.stdout || result.stderr);
+  let parsed: Record<string, unknown>;
+  if (isExecuteStreamJson) {
+    if (!terminalResultText) {
+      throw new Error('No terminal stream result (type="result") found in execute output');
+    }
+    try {
+      parsed = extractJsonObject(terminalResultText);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to parse terminal execute stream result: ${message}`);
+    }
+  } else {
+    parsed = extractJsonObject(result.stdout || result.stderr);
+  }
   if (streamJobLogs) {
     console.log(`[run/${runLabel}][${phaseName}] done`);
   }
@@ -667,7 +736,17 @@ export async function runLeasedJob(
         runLabel,
         'execute',
         executePrompt,
-        phaseTimeoutMs
+        phaseTimeoutMs,
+        null,
+        (output) => {
+          if (!output.trim()) {
+            return;
+          }
+          void executeStreamer.emitModelOutput({
+            level: 'info',
+            message: output
+          });
+        }
       );
       await executeStreamer.emitToolResult({
         action_id: executeActionId,
@@ -921,7 +1000,16 @@ export async function runLeasedJob(
       'execute',
       executePrompt,
       phaseTimeoutMs,
-      executeSchemaOverride
+      executeSchemaOverride,
+      (output) => {
+        if (!output.trim()) {
+          return;
+        }
+        void executeStreamer.emitModelOutput({
+          level: 'info',
+          message: output
+        });
+      }
     );
     await executeStreamer.emitToolResult({
       action_id: executeActionId,
