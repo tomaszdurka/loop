@@ -1,0 +1,3 @@
+module.exports=[47533,a=>{a.v({className:"space_grotesk_44e9a4b-module__Ok-oaG__className"})},76501,a=>{"use strict";var b=a.i(73593),c=a.i(47533);let d={className:c.default.className,style:{fontFamily:"'Space Grotesk', 'Space Grotesk Fallback'",fontStyle:"normal"}};function e({children:a}){return(0,b.jsx)("html",{lang:"en",children:(0,b.jsx)("body",{className:d.className,children:a})})}null!=c.default.variable&&(d.variable=c.default.variable),a.s(["default",()=>e,"metadata",0,{title:"Agentic Jobs",description:"Local jobs dashboard for agentic-loop"}],76501)}];
+
+//# sourceMappingURL=%5Broot-of-the-server%5D__5d3b892f._.js.map

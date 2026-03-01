@@ -14,6 +14,7 @@ export type StreamEnvelope = {
 };
 
 export type EmitFn = (envelope: StreamEnvelope) => Promise<void> | void;
+type SequenceRef = { value: number };
 
 export class RunStreamer {
   private sequence = 0;
@@ -21,11 +22,17 @@ export class RunStreamer {
   constructor(
     private readonly runId: string,
     private readonly phase: string,
-    private readonly emitFn: EmitFn
+    private readonly emitFn: EmitFn,
+    private readonly sequenceRef?: SequenceRef
   ) {}
 
   private async emit(type: StreamType, producer: StreamProducer, payload: Record<string, unknown>): Promise<StreamEnvelope> {
-    this.sequence += 1;
+    if (this.sequenceRef) {
+      this.sequenceRef.value += 1;
+      this.sequence = this.sequenceRef.value;
+    } else {
+      this.sequence += 1;
+    }
     const envelope: StreamEnvelope = {
       run_id: this.runId,
       sequence: this.sequence,
@@ -44,7 +51,7 @@ export class RunStreamer {
   }
 
   emitModelOutput(payload: Record<string, unknown>): Promise<StreamEnvelope> {
-    return this.emit('model_output', 'system', payload);
+    return this.emit('model_output', 'model', payload);
   }
 
   emitAction(payload: Record<string, unknown>): Promise<StreamEnvelope> {

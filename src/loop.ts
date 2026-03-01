@@ -36,7 +36,7 @@ function parseRunConfig(argv: string[]): AgenticLoopConfig {
   }
 
   const success = parsed.named.get('--success');
-  const provider = parsed.named.get('--provider') ?? 'codex';
+  const provider = parsed.named.get('--provider') ?? 'claude';
   if (provider !== 'codex' && provider !== 'claude') {
     throw new Error('--provider must be one of: codex, claude');
   }

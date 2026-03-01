@@ -15,6 +15,25 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function envelopeEventData(taskId: string, phase: string, level: 'info' | 'warn' | 'error', eventName: string, message: string, data: Record<string, unknown>): Record<string, unknown> {
+  return {
+    envelope: {
+      run_id: taskId,
+      sequence: 0,
+      timestamp: nowIso(),
+      type: 'event',
+      phase,
+      producer: 'system',
+      payload: {
+        event_name: eventName,
+        level,
+        message,
+        data
+      }
+    }
+  };
+}
+
 export class QueueRepository {
   constructor(private readonly db: Database.Database) {}
 
@@ -54,7 +73,7 @@ export class QueueRepository {
       phase: 'intake',
       level: 'info',
       message: 'Task created',
-      data: { type, title, priority }
+      data: envelopeEventData(id, 'intake', 'info', 'task_created', 'Task created', { type, title, priority })
     });
 
     return this.getTaskById(id)!;
@@ -116,7 +135,7 @@ export class QueueRepository {
           phase: 'lease',
           level: 'warn',
           message: 'Lease expired',
-          data: { next_status: nextStatus }
+          data: envelopeEventData(task.id, 'lease', 'warn', 'lease_expired', 'Lease expired', { next_status: nextStatus })
         });
       }
 
@@ -166,7 +185,10 @@ export class QueueRepository {
         phase: 'lease',
         level: 'info',
         message: 'Task leased',
-        data: { worker_id: workerId, lease_expires_at: leaseExpiresAt }
+        data: envelopeEventData(candidate.id, 'lease', 'info', 'task_leased', 'Task leased', {
+          worker_id: workerId,
+          lease_expires_at: leaseExpiresAt
+        })
       });
 
       return this.getTaskById(candidate.id);
@@ -213,7 +235,10 @@ export class QueueRepository {
         phase: 'preflight',
         level: 'info',
         message: 'Attempt started',
-        data: { attempt_no: attemptNo, worker_id: workerId }
+        data: envelopeEventData(taskId, 'preflight', 'info', 'attempt_started', 'Attempt started', {
+          attempt_no: attemptNo,
+          worker_id: workerId
+        })
       });
 
       return { attemptNo, attemptId: attempt.id, leaseExpiresAt: task.lease_expires_at };
@@ -304,11 +329,19 @@ export class QueueRepository {
         phase: result.finalPhase,
         level: result.succeeded ? 'info' : 'error',
         message: result.succeeded ? 'Task completed' : 'Task failed',
-        data: {
+        data: envelopeEventData(
+          taskId,
+          result.finalPhase,
+          result.succeeded ? 'info' : 'error',
+          result.succeeded ? 'task_completed' : 'task_failed',
+          result.succeeded ? 'Task completed' : 'Task failed',
+          {
           worker_id: workerId,
           worker_exit_code: result.workerExitCode,
-          next_status: nextStatus
+          next_status: nextStatus,
+          error_message: result.errorMessage
         }
+        )
       });
     });
 

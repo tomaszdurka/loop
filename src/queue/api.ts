@@ -240,38 +240,9 @@ export function startQueueApi(): void {
                 };
               }
               writeNdjson(normalized);
-              return;
             }
-
-            // For non-envelope records (interpret/plan/policy/verify/report, etc.),
-            // emit a normalized NDJSON event so full-mode progress is visible live.
-            writeNdjson({
-              run_id: runIdForStream ?? task.id,
-              sequence: nextSequence(),
-              timestamp: event.created_at,
-              type: 'event',
-              phase: event.phase,
-              producer: 'system',
-              payload: {
-                level: event.level,
-                message: event.message,
-                data
-              }
-            });
           } catch {
-            writeNdjson({
-              run_id: runIdForStream ?? task.id,
-              sequence: nextSequence(),
-              timestamp: event.created_at,
-              type: 'event',
-              phase: event.phase,
-              producer: 'system',
-              payload: {
-                level: event.level,
-                message: event.message,
-                data: {}
-              }
-            });
+            // Ignore malformed legacy event rows in run stream.
           }
         };
 

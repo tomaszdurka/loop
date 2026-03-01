@@ -128,3 +128,21 @@ Worker:
 - `WORKER_POLL_MS` (default `2000`)
 - `WORKER_LEASE_TTL_MS` (default `120000`)
 - `WORKER_PHASE_TIMEOUT_MS` (default `600000`)
+
+## Web UI (Next.js)
+
+Simple jobs dashboard is in `ui/` (Next.js + React + Tailwind):
+
+```bash
+cd ui
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`.
+
+Optional API base override:
+
+```bash
+AGENTIC_API_BASE_URL=http://localhost:7070 npm run dev
+```

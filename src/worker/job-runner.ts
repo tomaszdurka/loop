@@ -148,26 +148,6 @@ async function heartbeat(baseUrl: string, workerId: string, taskId: string, leas
   });
 }
 
-async function pushEvent(
-  baseUrl: string,
-  taskId: string,
-  workerId: string,
-  attemptId: number | null,
-  phase: string,
-  level: 'info' | 'warn' | 'error',
-  message: string,
-  data?: Record<string, unknown>
-): Promise<void> {
-  await postJson(baseUrl, `/tasks/${encodeURIComponent(taskId)}/events`, {
-    worker_id: workerId,
-    attempt_id: attemptId,
-    phase,
-    level,
-    message,
-    data: data ?? {}
-  });
-}
-
 async function pushEnvelope(
   baseUrl: string,
   taskId: string,
@@ -189,6 +169,43 @@ async function pushEnvelope(
     message: envelope.type,
     data: { envelope }
   });
+}
+
+type RunSequenceRef = {
+  value: number;
+};
+
+async function pushRunEvent(
+  baseUrl: string,
+  taskId: string,
+  workerId: string,
+  attemptId: number | null,
+  runId: string,
+  sequenceRef: RunSequenceRef,
+  input: {
+    phase: string;
+    level: 'info' | 'warn' | 'error';
+    eventName: string;
+    message: string;
+    data?: Record<string, unknown>;
+  }
+): Promise<void> {
+  sequenceRef.value += 1;
+  const envelope: StreamEnvelope = {
+    run_id: runId,
+    sequence: sequenceRef.value,
+    timestamp: new Date().toISOString(),
+    type: 'event',
+    phase: input.phase,
+    producer: 'system',
+    payload: {
+      event_name: input.eventName,
+      level: input.level,
+      message: input.message,
+      data: input.data ?? {}
+    }
+  };
+  await pushEnvelope(baseUrl, taskId, workerId, attemptId, envelope);
 }
 
 async function complete(baseUrl: string, workerId: string, taskId: string, payload: {
@@ -390,8 +407,16 @@ function parseStreamJsonLine(line: string): Record<string, unknown> | null {
   }
 }
 
-function extractTerminalResultText(streamItem: Record<string, unknown>): string | null {
-  if (streamItem.type !== 'result') {
+type ClaudeStreamNormalized = {
+  type: string | null;
+  subtype: string | null;
+  messageBody: string | null;
+  terminalResultText: string | null;
+};
+
+function extractClaudeTerminalResultText(streamItem: Record<string, unknown>): string | null {
+  const itemType = typeof streamItem.type === 'string' ? streamItem.type : null;
+  if (itemType !== 'result') {
     return null;
   }
   const result = streamItem.result;
@@ -402,6 +427,134 @@ function extractTerminalResultText(streamItem: Record<string, unknown>): string 
     return JSON.stringify(result);
   }
   return null;
+}
+
+function extractClaudeMessageBody(parsedLine: Record<string, unknown>): string | null {
+  const itemType = typeof parsedLine.type === 'string' ? parsedLine.type : null;
+
+  if (itemType === 'assistant') {
+    const message = parsedLine.message;
+    if (message && typeof message === 'object' && !Array.isArray(message)) {
+      const content = (message as Record<string, unknown>).content;
+      if (Array.isArray(content)) {
+        const textParts = content
+          .map((entry) => {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+              return null;
+            }
+            const part = entry as Record<string, unknown>;
+            if (part.type === 'text' && typeof part.text === 'string' && part.text.trim().length > 0) {
+              return part.text;
+            }
+            return null;
+          })
+          .filter((v): v is string => typeof v === 'string' && v.length > 0);
+        if (textParts.length > 0) {
+          return textParts.join('\n');
+        }
+      }
+    }
+  }
+
+  if (itemType === 'result' && typeof parsedLine.result === 'string' && parsedLine.result.trim().length > 0) {
+    return parsedLine.result;
+  }
+
+  return null;
+}
+
+function normalizeClaudeStreamLine(rawLine: string, parsedLine: Record<string, unknown> | null): ClaudeStreamNormalized {
+  if (!parsedLine) {
+    return {
+      type: null,
+      subtype: null,
+      messageBody: null,
+      terminalResultText: null
+    };
+  }
+
+  const type = typeof parsedLine.type === 'string' ? parsedLine.type : null;
+  const subtype = typeof parsedLine.subtype === 'string' ? parsedLine.subtype : null;
+  return {
+    type,
+    subtype,
+    messageBody: extractClaudeMessageBody(parsedLine),
+    terminalResultText: extractClaudeTerminalResultText(parsedLine)
+  };
+}
+
+function buildModelOutputEventPayloadForClaude(
+  normalized: ClaudeStreamNormalized
+): Record<string, unknown> {
+  return {
+    level: 'info',
+    message_body: normalized.messageBody,
+    model_event_type: normalized.type,
+    model_event_subtype: normalized.subtype
+  };
+}
+
+function extractModelMessageBody(parsedLine: Record<string, unknown>): string | null {
+  const message = parsedLine.message;
+  if (message && typeof message === 'object' && !Array.isArray(message)) {
+    const messageObj = message as Record<string, unknown>;
+    const content = messageObj.content;
+    if (Array.isArray(content)) {
+      const textParts = content
+        .map((entry) => {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            return null;
+          }
+          const obj = entry as Record<string, unknown>;
+          if (typeof obj.text === 'string' && obj.text.trim().length > 0) {
+            return obj.text;
+          }
+          if (obj.type === 'tool_use') {
+            const name = typeof obj.name === 'string' ? obj.name : 'tool';
+            return `[tool_use:${name}]`;
+          }
+          return null;
+        })
+        .filter((v): v is string => typeof v === 'string' && v.length > 0);
+      if (textParts.length > 0) {
+        return textParts.join('\n');
+      }
+    }
+  }
+
+  if (typeof parsedLine.result === 'string' && parsedLine.result.trim().length > 0) {
+    return parsedLine.result;
+  }
+
+  if (typeof parsedLine.message === 'string' && parsedLine.message.trim().length > 0) {
+    return parsedLine.message;
+  }
+
+  return null;
+}
+
+function buildModelOutputEventPayload(
+  rawLine: string,
+  parsedLine: Record<string, unknown> | null
+): Record<string, unknown> {
+  if (!parsedLine) {
+    return {
+      level: 'info',
+      message: rawLine,
+      raw_message: rawLine,
+      model_event_type: null,
+      model_event_subtype: null,
+      message_body: rawLine
+    };
+  }
+
+  return {
+    level: 'info',
+    message: parsedLine,
+    model_event_type: typeof parsedLine.type === 'string' ? parsedLine.type : null,
+    model_event_subtype: typeof parsedLine.subtype === 'string' ? parsedLine.subtype : null,
+    message_body: extractModelMessageBody(parsedLine)
+  };
 }
 
 function asStringArray(value: unknown): string[] {
@@ -520,7 +673,7 @@ async function runPhase(
   phasePrompt: string,
   phaseTimeoutMs: number,
   schemaOverride: { schemaJson: string; schemaPath: string } | null = null,
-  onOutput?: (output: string) => void
+  onOutput?: (output: string, parsedLine: Record<string, unknown> | null) => void
 ): Promise<Record<string, unknown>> {
   if (streamJobLogs) {
     console.log(`[run/${runLabel}][${phaseName}] start`);
@@ -537,18 +690,19 @@ async function runPhase(
     cmd.stdin,
     phaseTimeoutMs,
     (line) => {
-      onOutput?.(line);
-      if (!isExecuteStreamJson) {
-        return;
-      }
       const item = parseStreamJsonLine(line);
-      if (!item) {
+      if (isExecuteStreamJson) {
+        const normalized = normalizeClaudeStreamLine(line, item);
+        if (normalized.messageBody) {
+          onOutput?.(line, item);
+        }
+        if (typeof normalized.terminalResultText === 'string' && normalized.terminalResultText.length > 0) {
+          terminalResultText = normalized.terminalResultText;
+        }
         return;
       }
-      const extracted = extractTerminalResultText(item);
-      if (typeof extracted === 'string' && extracted.length > 0) {
-        terminalResultText = extracted;
-      }
+
+      onOutput?.(line, item);
     }
   );
   if (result.spawnError) {
@@ -636,9 +790,10 @@ export async function runLeasedJob(
   const runId = `run_${Date.now().toString(36)}${randomUUID().replace(/-/g, '').slice(0, 6)}`;
   const runLabel = runId.slice(4);
   const runDir = createRunDir(runId);
+  const sequenceRef: RunSequenceRef = { value: 0 };
   const executeStreamer = new RunStreamer(runId, 'execute', async (envelope) => {
     await pushEnvelope(baseUrl, task.id, workerId, attemptId, envelope);
-  });
+  }, sequenceRef);
 
   const heartbeatTimer = setInterval(() => {
     heartbeat(baseUrl, workerId, task.id, leaseTtlMs).catch((error) => {
@@ -662,7 +817,12 @@ export async function runLeasedJob(
     if (configuredMode === 'lean' || configuredMode === 'full') {
       effectiveMode = configuredMode;
     } else {
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'mode', 'info', 'Mode classification started');
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'mode',
+        level: 'info',
+        eventName: 'mode_classification_started',
+        message: 'Mode classification started'
+      });
       modeDecision = await runPhase(
         options.provider,
         runDir,
@@ -683,10 +843,16 @@ export async function runLeasedJob(
       effectiveMode = modeDecision.mode === 'full' ? 'full' : 'lean';
     }
 
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'mode', 'info', 'Mode selected', {
-      configured_mode: configuredMode,
-      effective_mode: effectiveMode,
-      classifier: modeDecision
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'mode',
+      level: 'info',
+      eventName: 'mode_selected',
+      message: 'Mode selected',
+      data: {
+        configured_mode: configuredMode,
+        effective_mode: effectiveMode,
+        classifier: modeDecision
+      }
     });
 
     if (effectiveMode === 'lean') {
@@ -716,8 +882,12 @@ export async function runLeasedJob(
         ].join('\n'),
         { task, mode: effectiveMode }
       );
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started', {
-        llm_prompt: executePrompt
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'execute',
+        level: 'info',
+        eventName: 'execution_started',
+        message: 'Execution started',
+        data: { llm_prompt: executePrompt }
       });
       const executeActionId = `a_${randomUUID().slice(0, 8)}`;
       const executeIdempotencyKey = `ik:${task.id}:execute:${executeActionId}`;
@@ -738,14 +908,19 @@ export async function runLeasedJob(
         executePrompt,
         phaseTimeoutMs,
         null,
-        (output) => {
+        (output, parsedLine) => {
           if (!output.trim()) {
             return;
           }
-          void executeStreamer.emitModelOutput({
-            level: 'info',
-            message: output
-          });
+          if (options.provider === 'claude') {
+            const normalized = normalizeClaudeStreamLine(output, parsedLine);
+            if (!normalized.messageBody) {
+              return;
+            }
+            void executeStreamer.emitModelOutput(buildModelOutputEventPayloadForClaude(normalized));
+            return;
+          }
+          void executeStreamer.emitModelOutput(buildModelOutputEventPayload(output, parsedLine));
         }
       );
       await executeStreamer.emitToolResult({
@@ -761,13 +936,22 @@ export async function runLeasedJob(
         format: 'json',
         content: execute
       }, 'system');
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution completed', {
-        output: execute
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'execute',
+        level: 'info',
+        eventName: 'execution_completed',
+        message: 'Execution completed',
+        data: { output: execute }
       });
 
       let verify: Record<string, unknown>;
       if (task.success_criteria && task.success_criteria.trim().length > 0) {
-        await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification started');
+        await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+          phase: 'verify',
+          level: 'info',
+          eventName: 'verification_started',
+          message: 'Verification started'
+        });
         verify = await runPhase(
           options.provider,
           runDir,
@@ -780,8 +964,12 @@ export async function runLeasedJob(
           }),
           phaseTimeoutMs
         );
-        await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification completed', {
-          output: verify
+        await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+          phase: 'verify',
+          level: 'info',
+          eventName: 'verification_completed',
+          message: 'Verification completed',
+          data: { output: verify }
         });
       } else {
         const pass = execute.status === 'succeeded';
@@ -791,12 +979,21 @@ export async function runLeasedJob(
           failures: pass ? [] : ['Execution did not return succeeded'],
           recommended_next_actions: pass ? [] : ['Add success_criteria for stronger verification']
         };
-        await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification skipped (no success_criteria)', {
-          fallback_pass: pass
+        await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+          phase: 'verify',
+          level: 'info',
+          eventName: 'verification_skipped',
+          message: 'Verification skipped (no success_criteria)',
+          data: { fallback_pass: pass }
         });
       }
 
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting started');
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'report',
+        level: 'info',
+        eventName: 'reporting_started',
+        message: 'Reporting started'
+      });
       const report = await runPhase(
         options.provider,
         runDir,
@@ -810,8 +1007,12 @@ export async function runLeasedJob(
         }),
         phaseTimeoutMs
       );
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting completed', {
-        output: report
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'report',
+        level: 'info',
+        eventName: 'reporting_completed',
+        message: 'Reporting completed',
+        data: { output: report }
       });
 
       const pass = evaluateVerifyPass(verify);
@@ -832,7 +1033,12 @@ export async function runLeasedJob(
       return pass;
     }
 
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'interpret', 'info', 'Interpretation started');
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'interpret',
+      level: 'info',
+      eventName: 'interpretation_started',
+      message: 'Interpretation started'
+    });
     const interpret = await runPhase(
       options.provider,
       runDir,
@@ -850,8 +1056,12 @@ export async function runLeasedJob(
       }),
       phaseTimeoutMs
     );
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'interpret', 'info', 'Interpretation completed', {
-      output: interpret
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'interpret',
+      level: 'info',
+      eventName: 'interpretation_completed',
+      message: 'Interpretation completed',
+      data: { output: interpret }
     });
 
     const criticalBlocker = interpret.critical_blocker === true;
@@ -864,8 +1074,14 @@ export async function runLeasedJob(
         }
       };
 
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'interpret', 'warn', 'Task blocked for clarification', {
-        clarifications_needed: interpret.clarifications_needed ?? []
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'interpret',
+        level: 'warn',
+        eventName: 'blocked_for_clarification',
+        message: 'Task blocked for clarification',
+        data: {
+          clarifications_needed: interpret.clarifications_needed ?? []
+        }
       });
 
       await complete(baseUrl, workerId, task.id, {
@@ -881,12 +1097,23 @@ export async function runLeasedJob(
     }
 
     if (requestedBlockedRoute && !criticalBlocker) {
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'interpret', 'warn', 'Non-critical clarification ignored; continuing', {
-        clarifications_needed: interpret.clarifications_needed ?? []
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'interpret',
+        level: 'warn',
+        eventName: 'clarification_ignored',
+        message: 'Non-critical clarification ignored; continuing',
+        data: {
+          clarifications_needed: interpret.clarifications_needed ?? []
+        }
       });
     }
 
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'plan', 'info', 'Planning started');
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'plan',
+      level: 'info',
+      eventName: 'planning_started',
+      message: 'Planning started'
+    });
     const plan = await runPhase(
       options.provider,
       runDir,
@@ -896,11 +1123,20 @@ export async function runLeasedJob(
       buildPhasePrompt(basePrompt, planPrompt, { task, interpret }),
       phaseTimeoutMs
     );
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'plan', 'info', 'Planning completed', {
-      output: plan
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'plan',
+      level: 'info',
+      eventName: 'planning_completed',
+      message: 'Planning completed',
+      data: { output: plan }
     });
 
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execution policy started');
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'policy',
+      level: 'info',
+      eventName: 'policy_started',
+      message: 'Execution policy started'
+    });
     const executionPolicy = await runPhase(
       options.provider,
       runDir,
@@ -910,14 +1146,24 @@ export async function runLeasedJob(
       buildPhasePrompt(basePrompt, policyPrompt, { task, interpret, plan }),
       phaseTimeoutMs
     );
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execution policy completed', {
-      output: executionPolicy
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'policy',
+      level: 'info',
+      eventName: 'policy_completed',
+      message: 'Execution policy completed',
+      data: { output: executionPolicy }
     });
     const executeSchemaOverride = resolveExecuteSchemaOverride(runDir, plan);
     if (executeSchemaOverride) {
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Execute schema enforced from plan', {
-        execute_output_format: plan.execute_output_format ?? 'json',
-        execute_output_strict: true
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'policy',
+        level: 'info',
+        eventName: 'execute_schema_enforced',
+        message: 'Execute schema enforced from plan',
+        data: {
+          execute_output_format: plan.execute_output_format ?? 'json',
+          execute_output_strict: true
+        }
       });
     }
 
@@ -938,8 +1184,12 @@ export async function runLeasedJob(
         }
       };
 
-      await pushEvent(baseUrl, task.id, workerId, attemptId, 'policy', 'info', 'Deduplication hit', {
-        idempotency_key: idempotencyKey
+      await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+        phase: 'policy',
+        level: 'info',
+        eventName: 'dedup_hit',
+        message: 'Deduplication hit',
+        data: { idempotency_key: idempotencyKey }
       });
 
       await complete(baseUrl, workerId, task.id, {
@@ -973,8 +1223,12 @@ export async function runLeasedJob(
       ].join('\n'),
       { task, interpret, plan, execution_policy: executionPolicy }
     );
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution started', {
-      llm_prompt: executePrompt
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'execute',
+      level: 'info',
+      eventName: 'execution_started',
+      message: 'Execution started',
+      data: { llm_prompt: executePrompt }
     });
     await executeStreamer.emitStateChange({ from: 'pending', to: 'running' });
     await executeStreamer.emitEvent({
@@ -1001,14 +1255,19 @@ export async function runLeasedJob(
       executePrompt,
       phaseTimeoutMs,
       executeSchemaOverride,
-      (output) => {
+      (output, parsedLine) => {
         if (!output.trim()) {
           return;
         }
-        void executeStreamer.emitModelOutput({
-          level: 'info',
-          message: output
-        });
+        if (options.provider === 'claude') {
+          const normalized = normalizeClaudeStreamLine(output, parsedLine);
+          if (!normalized.messageBody) {
+            return;
+          }
+          void executeStreamer.emitModelOutput(buildModelOutputEventPayloadForClaude(normalized));
+          return;
+        }
+        void executeStreamer.emitModelOutput(buildModelOutputEventPayload(output, parsedLine));
       }
     );
     await executeStreamer.emitToolResult({
@@ -1024,11 +1283,20 @@ export async function runLeasedJob(
       format: 'json',
       content: execute
     }, 'system');
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'execute', 'info', 'Execution completed', {
-      output: execute
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'execute',
+      level: 'info',
+      eventName: 'execution_completed',
+      message: 'Execution completed',
+      data: { output: execute }
     });
 
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification started');
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'verify',
+      level: 'info',
+      eventName: 'verification_started',
+      message: 'Verification started'
+    });
     const verify = await runPhase(
       options.provider,
       runDir,
@@ -1044,26 +1312,39 @@ export async function runLeasedJob(
       }),
       phaseTimeoutMs
     );
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'verify', 'info', 'Verification completed', {
-      output: verify
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'verify',
+      level: 'info',
+      eventName: 'verification_completed',
+      message: 'Verification completed',
+      data: { output: verify }
     });
 
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting started');
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'report',
+      level: 'info',
+      eventName: 'reporting_started',
+      message: 'Reporting started'
+    });
     const report = await runPhase(
       options.provider,
       runDir,
       options.streamJobLogs,
       runLabel,
       'report',
-      buildPhasePrompt(reportPrompt, '# Input\nReturn JSON only.', {
+      buildPhasePrompt(basePrompt, reportPrompt, {
         task,
         verify,
         execute_result: execute
       }),
       phaseTimeoutMs
     );
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'report', 'info', 'Reporting completed', {
-      output: report
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'report',
+      level: 'info',
+      eventName: 'reporting_completed',
+      message: 'Reporting completed',
+      data: { output: report }
     });
 
     const pass = evaluateVerifyPass(verify);
@@ -1103,7 +1384,13 @@ export async function runLeasedJob(
     return pass;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await pushEvent(baseUrl, task.id, workerId, attemptId, 'runtime', 'error', 'Worker runtime error', { message });
+    await pushRunEvent(baseUrl, task.id, workerId, attemptId, runId, sequenceRef, {
+      phase: 'runtime',
+      level: 'error',
+      eventName: 'runtime_error',
+      message: 'Worker runtime error',
+      data: { message }
+    });
 
     await complete(baseUrl, workerId, task.id, {
       worker_exit_code: 1,
