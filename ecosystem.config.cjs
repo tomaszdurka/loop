@@ -5,7 +5,7 @@ module.exports = {
       namespace: 'agentic-loop',
       cwd: '/Users/tomasz/projects/akrudio/worker',
       script: '/bin/bash',
-      args: '-lc "npm run queue:api"',
+      args: '-c "npm run queue:api"',
       time: true
     },
     {
@@ -13,7 +13,7 @@ module.exports = {
       namespace: 'agentic-loop',
       cwd: '/Users/tomasz/projects/akrudio/worker',
       script: '/bin/bash',
-      args: '-lc "npm run loop -- worker --stream-job-logs"',
+      args: '-c "npm run loop -- worker --stream-job-logs"',
       time: true
     },
     {
@@ -21,7 +21,7 @@ module.exports = {
       namespace: 'agentic-loop',
       cwd: '/Users/tomasz/projects/akrudio/worker',
       script: '/bin/bash',
-      args: '-lc "cd ui && npm run build && npm run start"',
+      args: '-c "cd ui && npm run build && npm run start"',
       time: true
     }
   ]
