@@ -5,6 +5,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { TaskRow } from '../queue/types.js';
 import { RunStreamer, type StreamEnvelope } from './execute-runner.js';
+import { createProviderExecutor } from './providers/create-provider-executor.js';
+import type { ProviderExecutorMessage } from './providers/types.js';
 
 export type WorkerRuntimeOptions = {
   streamJobLogs: boolean;
@@ -268,37 +270,6 @@ function readPhaseSchema(phaseName: string): { schemaJson: string; schemaPath: s
   };
 }
 
-function buildProviderCommand(
-  provider: 'codex' | 'claude',
-  prompt: string,
-  schema: { schemaJson: string; schemaPath: string } | null
-): { command: string; args: string[]; stdin: string | null } {
-  if (provider === 'claude') {
-    const args = ['--dangerously-skip-permissions', '--print'];
-    if (schema) {
-      args.push( '--output-format', 'json', '--json-schema', schema.schemaJson);
-    } else {
-      args.push('--verbose', '--output-format', 'stream-json');
-    }
-    return {
-      command: 'claude',
-      args,
-      stdin: prompt
-    };
-  }
-
-  const args = ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'];
-  if (schema) {
-    args.push('--output-schema', schema.schemaPath);
-  }
-  args.push(prompt);
-  return {
-    command: 'codex',
-    args,
-    stdin: null
-  };
-}
-
 function buildPhasePrompt(base: string, phaseText: string, input: Record<string, unknown>): string {
   return [
     base,
@@ -389,172 +360,6 @@ function extractJsonObject(raw: string): Record<string, unknown> {
   }
 
   throw new Error('No JSON object found in model output');
-}
-
-function parseStreamJsonLine(line: string): Record<string, unknown> | null {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return null;
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-type ClaudeStreamNormalized = {
-  type: string | null;
-  subtype: string | null;
-  messageBody: string | null;
-  terminalResultText: string | null;
-};
-
-function extractClaudeTerminalResultText(streamItem: Record<string, unknown>): string | null {
-  const itemType = typeof streamItem.type === 'string' ? streamItem.type : null;
-  if (itemType !== 'result') {
-    return null;
-  }
-  const result = streamItem.result;
-  if (typeof result === 'string') {
-    return result;
-  }
-  if (result && typeof result === 'object' && !Array.isArray(result)) {
-    return JSON.stringify(result);
-  }
-  return null;
-}
-
-function extractClaudeMessageBody(parsedLine: Record<string, unknown>): string | null {
-  const itemType = typeof parsedLine.type === 'string' ? parsedLine.type : null;
-
-  if (itemType === 'assistant') {
-    const message = parsedLine.message;
-    if (message && typeof message === 'object' && !Array.isArray(message)) {
-      const content = (message as Record<string, unknown>).content;
-      if (Array.isArray(content)) {
-        const textParts = content
-          .map((entry) => {
-            if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-              return null;
-            }
-            const part = entry as Record<string, unknown>;
-            if (part.type === 'text' && typeof part.text === 'string' && part.text.trim().length > 0) {
-              return part.text;
-            }
-            return null;
-          })
-          .filter((v): v is string => typeof v === 'string' && v.length > 0);
-        if (textParts.length > 0) {
-          return textParts.join('\n');
-        }
-      }
-    }
-  }
-
-  if (itemType === 'result' && typeof parsedLine.result === 'string' && parsedLine.result.trim().length > 0) {
-    return parsedLine.result;
-  }
-
-  return null;
-}
-
-function normalizeClaudeStreamLine(rawLine: string, parsedLine: Record<string, unknown> | null): ClaudeStreamNormalized {
-  if (!parsedLine) {
-    return {
-      type: null,
-      subtype: null,
-      messageBody: null,
-      terminalResultText: null
-    };
-  }
-
-  const type = typeof parsedLine.type === 'string' ? parsedLine.type : null;
-  const subtype = typeof parsedLine.subtype === 'string' ? parsedLine.subtype : null;
-  return {
-    type,
-    subtype,
-    messageBody: extractClaudeMessageBody(parsedLine),
-    terminalResultText: extractClaudeTerminalResultText(parsedLine)
-  };
-}
-
-function buildModelOutputEventPayloadForClaude(
-  normalized: ClaudeStreamNormalized
-): Record<string, unknown> {
-  return {
-    level: 'info',
-    message_body: normalized.messageBody,
-    model_event_type: normalized.type,
-    model_event_subtype: normalized.subtype
-  };
-}
-
-function extractModelMessageBody(parsedLine: Record<string, unknown>): string | null {
-  const message = parsedLine.message;
-  if (message && typeof message === 'object' && !Array.isArray(message)) {
-    const messageObj = message as Record<string, unknown>;
-    const content = messageObj.content;
-    if (Array.isArray(content)) {
-      const textParts = content
-        .map((entry) => {
-          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-            return null;
-          }
-          const obj = entry as Record<string, unknown>;
-          if (typeof obj.text === 'string' && obj.text.trim().length > 0) {
-            return obj.text;
-          }
-          if (obj.type === 'tool_use') {
-            const name = typeof obj.name === 'string' ? obj.name : 'tool';
-            return `[tool_use:${name}]`;
-          }
-          return null;
-        })
-        .filter((v): v is string => typeof v === 'string' && v.length > 0);
-      if (textParts.length > 0) {
-        return textParts.join('\n');
-      }
-    }
-  }
-
-  if (typeof parsedLine.result === 'string' && parsedLine.result.trim().length > 0) {
-    return parsedLine.result;
-  }
-
-  if (typeof parsedLine.message === 'string' && parsedLine.message.trim().length > 0) {
-    return parsedLine.message;
-  }
-
-  return null;
-}
-
-function buildModelOutputEventPayload(
-  rawLine: string,
-  parsedLine: Record<string, unknown> | null
-): Record<string, unknown> {
-  if (!parsedLine) {
-    return {
-      level: 'info',
-      message: rawLine,
-      raw_message: rawLine,
-      model_event_type: null,
-      model_event_subtype: null,
-      message_body: rawLine
-    };
-  }
-
-  return {
-    level: 'info',
-    message: parsedLine,
-    model_event_type: typeof parsedLine.type === 'string' ? parsedLine.type : null,
-    model_event_subtype: typeof parsedLine.subtype === 'string' ? parsedLine.subtype : null,
-    message_body: extractModelMessageBody(parsedLine)
-  };
 }
 
 function asStringArray(value: unknown): string[] {
@@ -673,15 +478,16 @@ async function runPhase(
   phasePrompt: string,
   phaseTimeoutMs: number,
   schemaOverride: { schemaJson: string; schemaPath: string } | null = null,
-  onOutput?: (output: string, parsedLine: Record<string, unknown> | null) => void
+  onMessage?: (message: ProviderExecutorMessage) => void
 ): Promise<Record<string, unknown>> {
   if (streamJobLogs) {
     console.log(`[run/${runLabel}][${phaseName}] start`);
   }
 
   const schema = schemaOverride ?? readPhaseSchema(phaseName);
-  const cmd = buildProviderCommand(provider, phasePrompt, schema);
-  const isExecuteStreamJson = provider === 'claude' && phaseName === 'execute' && !schema;
+  const executor = createProviderExecutor(provider, phaseName, schema, onMessage);
+  const cmd = executor.buildCommand(phasePrompt);
+  const isTerminalStream = executor.isTerminalStream();
   let terminalResultText: string | null = null;
   const result = await runCommand(
     cmd.command,
@@ -690,19 +496,13 @@ async function runPhase(
     cmd.stdin,
     phaseTimeoutMs,
     (line) => {
-      const item = parseStreamJsonLine(line);
-      if (isExecuteStreamJson) {
-        const normalized = normalizeClaudeStreamLine(line, item);
-        if (normalized.messageBody) {
-          onOutput?.(line, item);
+      executor.handleOutputLine(line);
+      if (isTerminalStream) {
+        const nextTerminal = executor.getTerminalResultText();
+        if (nextTerminal) {
+          terminalResultText = nextTerminal;
         }
-        if (typeof normalized.terminalResultText === 'string' && normalized.terminalResultText.length > 0) {
-          terminalResultText = normalized.terminalResultText;
-        }
-        return;
       }
-
-      onOutput?.(line, item);
     }
   );
   if (result.spawnError) {
@@ -719,7 +519,7 @@ async function runPhase(
   }
 
   let parsed: Record<string, unknown>;
-  if (isExecuteStreamJson) {
+  if (isTerminalStream) {
     if (!terminalResultText) {
       throw new Error('No terminal stream result (type="result") found in execute output');
     }
@@ -897,7 +697,7 @@ export async function runLeasedJob(
         tool: 'llm_execute',
         arguments: { prompt: executePrompt },
         idempotency_key: executeIdempotencyKey
-      });
+      }, 'system');
 
       const execute = await runPhase(
         options.provider,
@@ -908,19 +708,11 @@ export async function runLeasedJob(
         executePrompt,
         phaseTimeoutMs,
         null,
-        (output, parsedLine) => {
-          if (!output.trim()) {
+        (message) => {
+          if (!message.modelOutputPayload) {
             return;
           }
-          if (options.provider === 'claude') {
-            const normalized = normalizeClaudeStreamLine(output, parsedLine);
-            if (!normalized.messageBody) {
-              return;
-            }
-            void executeStreamer.emitModelOutput(buildModelOutputEventPayloadForClaude(normalized));
-            return;
-          }
-          void executeStreamer.emitModelOutput(buildModelOutputEventPayload(output, parsedLine));
+          void executeStreamer.emitModelOutput(message.modelOutputPayload);
         }
       );
       await executeStreamer.emitToolResult({
@@ -1244,7 +1036,7 @@ export async function runLeasedJob(
       tool: 'llm_execute',
       arguments: { prompt: executePrompt },
       idempotency_key: executeIdempotencyKey
-    });
+    }, 'system');
 
     const execute = await runPhase(
       options.provider,
@@ -1255,19 +1047,11 @@ export async function runLeasedJob(
       executePrompt,
       phaseTimeoutMs,
       executeSchemaOverride,
-      (output, parsedLine) => {
-        if (!output.trim()) {
+      (message) => {
+        if (!message.modelOutputPayload) {
           return;
         }
-        if (options.provider === 'claude') {
-          const normalized = normalizeClaudeStreamLine(output, parsedLine);
-          if (!normalized.messageBody) {
-            return;
-          }
-          void executeStreamer.emitModelOutput(buildModelOutputEventPayloadForClaude(normalized));
-          return;
-        }
-        void executeStreamer.emitModelOutput(buildModelOutputEventPayload(output, parsedLine));
+        void executeStreamer.emitModelOutput(message.modelOutputPayload);
       }
     );
     await executeStreamer.emitToolResult({

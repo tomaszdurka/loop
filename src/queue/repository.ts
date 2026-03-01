@@ -15,6 +15,26 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function deriveTitleFromPrompt(prompt: string): string {
+  const normalized = prompt
+    .replace(/\s+/g, ' ')
+    .replace(/[`*_#>"']/g, '')
+    .trim();
+  if (!normalized) {
+    return 'Untitled task';
+  }
+
+  const firstSentence = normalized
+    .split(/[.!?]/)
+    .map((part) => part.trim())
+    .find((part) => part.length > 0) ?? normalized;
+
+  const title = firstSentence.length > 72
+    ? `${firstSentence.slice(0, 72).trim()}...`
+    : firstSentence;
+  return title || 'Untitled task';
+}
+
 function envelopeEventData(taskId: string, phase: string, level: 'info' | 'warn' | 'error', eventName: string, message: string, data: Record<string, unknown>): Record<string, unknown> {
   return {
     envelope: {
@@ -41,10 +61,10 @@ export class QueueRepository {
     const id = randomUUID();
     const now = nowIso();
     const type = input.type?.trim() || 'generic';
-    const title = input.title?.trim() || 'Untitled task';
+    const mode = input.mode ?? 'auto';
+    const title = input.title?.trim() || (mode === 'full' ? deriveTitleFromPrompt(input.prompt) : 'Untitled task');
     const successCriteria = input.successCriteria?.trim() || null;
     const metadata = input.metadata ?? {};
-    const mode = input.mode ?? 'auto';
     const priority = Number.isInteger(input.priority) ? Math.max(1, Math.min(5, input.priority!)) : 3;
     const maxAttempts = Number.isInteger(input.maxAttempts) ? Math.max(1, input.maxAttempts!) : defaultMaxAttempts;
 
